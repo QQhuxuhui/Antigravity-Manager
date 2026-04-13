@@ -134,6 +134,10 @@
         "proxy_disabled_tooltip": "Bu hesabın proxy'si manuel olarak devre dışı bırakıldı, API isteklerini işlemez ancak uygulamada kullanılabilir durumda kalır.",
         "enable_proxy": "Proxy'yi Etkinleştir",
         "disable_proxy": "Proxy'yi Devre Dışı Bırak",
+        "overages": {
+            "title": "AI Credits Aşımı",
+            "desc": "Ücretsiz kota tükendikten sonra hesabın/aile grubunun AI Credits'lerini tüketmeye devam eder (Ultra aboneliği gerektirir)."
+        },
         "enable_proxy_selected": "Etkinleştir ({{count}})",
         "disable_proxy_selected": "Devre Dışı Bırak ({{count}})",
         "proxy_disabled_reason_manual": "Kullanıcı tarafından manuel olarak devre dışı bırakıldı",

@@ -141,6 +141,10 @@
         "proxy_disabled_tooltip": "이 계정은 수동으로 프록시가 비활성화되었습니다. API 요청을 처리하지 않지만 앱 내에서는 계속 사용할 수 있습니다.",
         "enable_proxy": "프록시 활성화",
         "disable_proxy": "프록시 비활성화",
+        "overages": {
+            "title": "AI Credits 초과 사용",
+            "desc": "무료 할당량 소진 후 계정/가족 그룹의 AI Credits를 계속 소비합니다 (Ultra 등 Credits 지원 구독 필요)."
+        },
         "enable_proxy_selected": "활성화 ({{count}})",
         "disable_proxy_selected": "비활성화 ({{count}})",
         "proxy_disabled_reason_manual": "사용자에 의해 수동으로 비활성화됨",

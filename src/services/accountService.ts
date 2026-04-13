@@ -141,6 +141,14 @@ export async function toggleProxyStatus(accountId: string, enable: boolean, reas
 }
 
 /**
+ * 切换账号的 AI Credits Overage 开关。
+ * 打开后，免费配额耗尽时会自动走 AI Credits 继续服务（仅 Ultra/家庭组等有效）。
+ */
+export async function toggleOveragesEnabled(accountId: string, enabled: boolean): Promise<void> {
+    return await invoke('toggle_overages_enabled', { accountId, enabled });
+}
+
+/**
  * 重新排序账号列表
  * @param accountIds 按新顺序排列的账号ID数组
  */

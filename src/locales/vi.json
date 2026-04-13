@@ -136,6 +136,10 @@
         "proxy_disabled_tooltip": "Tài khoản này đã bị tắt thủ công khỏi proxy, sẽ không xử lý request API nhưng vẫn dùng được trong app.",
         "enable_proxy": "Bật Proxy",
         "disable_proxy": "Tắt Proxy",
+        "overages": {
+            "title": "Sử dụng AI Credits Vượt Mức",
+            "desc": "Sau khi hết hạn ngạch miễn phí, tiếp tục tiêu thụ AI Credits của tài khoản/nhóm gia đình (yêu cầu gói Ultra)."
+        },
         "enable_proxy_selected": "Bật ({{count}})",
         "disable_proxy_selected": "Tắt ({{count}})",
         "proxy_disabled_reason_manual": "Đã tắt thủ công bởi người dùng",

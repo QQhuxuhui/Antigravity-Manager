@@ -140,6 +140,10 @@
         "proxy_disabled_tooltip": "تم تعطيل الوكيل لهذا الحساب يدويًا، لن يعالج طلبات API ولكنه يظل قابلاً للاستخدام في التطبيق.",
         "enable_proxy": "تفعيل الوكيل",
         "disable_proxy": "تعطيل الوكيل",
+        "overages": {
+            "title": "فائض رصيد AI Credits",
+            "desc": "بعد نفاد الحصة المجانية، يستمر في استهلاك رصيد AI Credits للحساب/المجموعة العائلية (يتطلب اشتراك Ultra)."
+        },
         "enable_proxy_selected": "تفعيل ({{count}})",
         "disable_proxy_selected": "تعطيل ({{count}})",
         "proxy_disabled_reason_manual": "تم التعطيل يدويًا بواسطة المستخدم",

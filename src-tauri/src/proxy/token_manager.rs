@@ -36,6 +36,8 @@ pub struct ProxyToken {
     pub validation_url: Option<String>,    // [NEW] Validation URL (#1522)
     pub model_quotas: HashMap<String, i32>, // [OPTIMIZATION] In-memory cache for model-specific quotas
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
+    /// [NEW] AI Credits 溢出（Overages）开关，镜像自 Account.overages_enabled。
+    pub overages_enabled: bool,
 }
 
 pub struct TokenManager {
@@ -538,6 +540,7 @@ impl TokenManager {
             validation_url: account.get("validation_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
             model_quotas,
             model_limits,
+            overages_enabled: account.get("overages_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
         }))
     }
 
@@ -2512,6 +2515,19 @@ impl TokenManager {
     }
 
     /// Helper to find account ID by email
+    // ===== AI Credits Overage 支持 =====
+
+    /// 按 email 查询该账号是否已开启 AI Credits Overage。
+    /// handler 拿到的通常是 email，此处做一次反查。
+    pub fn is_overages_enabled_by_email(&self, email: &str) -> bool {
+        for entry in self.tokens.iter() {
+            if entry.value().email == email {
+                return entry.value().overages_enabled;
+            }
+        }
+        false
+    }
+
     pub fn get_account_id_by_email(&self, email: &str) -> Option<String> {
         for entry in self.tokens.iter() {
             if entry.value().email == email {
@@ -2868,6 +2884,7 @@ mod tests {
             validation_url: None,
             model_quotas: HashMap::new(),
             model_limits: HashMap::new(),
+            overages_enabled: false,
         }
     }
 
@@ -3126,6 +3143,7 @@ mod tests {
             validation_url: None,
             model_quotas: HashMap::new(),
             model_limits: HashMap::new(),
+            overages_enabled: false,
         }
     }
 

@@ -1,18 +1,68 @@
-import { X, Clock, AlertCircle, Bot } from 'lucide-react';
+import { X, Clock, AlertCircle, Bot, Sparkles } from 'lucide-react';
 import { createPortal } from 'react-dom';
+import { useState, useEffect } from 'react';
 import { Account } from '../../types/account';
 import { formatDate } from '../../utils/format';
 import { useTranslation } from 'react-i18next';
 import { MODEL_CONFIG, sortModels } from '../../config/modelConfig';
+import { toggleOveragesEnabled } from '../../services/accountService';
+import { useAccountStore } from '../../stores/useAccountStore';
 
 interface AccountDetailsDialogProps {
     account: Account | null;
     onClose: () => void;
 }
 
-export default function AccountDetailsDialog({ account, onClose }: AccountDetailsDialogProps) {
+export default function AccountDetailsDialog({ account: accountProp, onClose }: AccountDetailsDialogProps) {
     const { t } = useTranslation();
+    const fetchAccounts = useAccountStore(s => s.fetchAccounts);
+    // 父组件传入的是打开弹窗那一刻的快照，不会随 store 更新。
+    // 这里订阅 store，用 id 反查到最新账号对象，保证 toggle 等操作后 UI 同步。
+    const liveAccount = useAccountStore(s =>
+        accountProp ? s.accounts.find(a => a.id === accountProp.id) : undefined
+    );
+    const account = liveAccount ?? accountProp;
+
+    const [overageBusy, setOverageBusy] = useState(false);
+    // 乐观态仅用于"等后端写盘 + 列表刷新完成"的短暂窗口；
+    // 一旦账号切换或 fetchAccounts 把真值带回来，就清空，让 props/store 真值接管。
+    const [overageOptimistic, setOverageOptimistic] = useState<boolean | null>(null);
+
+    // 切账号时清空乐观态，避免串账号。
+    useEffect(() => {
+        setOverageOptimistic(null);
+        setOverageBusy(false);
+    }, [account?.id]);
+
     if (!account) return null;
+
+    const overageOn = overageOptimistic ?? (account.overages_enabled ?? false);
+    const handleToggleOverage = async () => {
+        if (overageBusy) return;
+        const next = !overageOn;
+        const prev = overageOn;
+        setOverageBusy(true);
+        setOverageOptimistic(next);
+        try {
+            // toggle 本身失败 → 回滚；成功但刷新失败 → 保留 optimistic（真值已改）
+            try {
+                await toggleOveragesEnabled(account.id, next);
+            } catch (toggleErr) {
+                setOverageOptimistic(prev);
+                console.error('toggle overages failed:', toggleErr);
+                return;
+            }
+            try {
+                await fetchAccounts();
+                // 刷新成功后让 props 的真值接管，清空乐观态。
+                setOverageOptimistic(null);
+            } catch (refreshErr) {
+                console.warn('toggle succeeded but refresh failed:', refreshErr);
+            }
+        } finally {
+            setOverageBusy(false);
+        }
+    };
 
     return createPortal(
         <div className="modal modal-open z-[100]">
@@ -65,6 +115,29 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
 
                 {/* Content */}
                 <div className="p-6 max-h-[60vh] overflow-y-auto">
+                    {/* AI Credits Overage Toggle */}
+                    <div className="mb-5 p-3 rounded-lg border border-purple-200 dark:border-purple-900/40 bg-gradient-to-r from-purple-50 to-transparent dark:from-purple-950/20 flex items-center gap-3">
+                        <Sparkles size={16} className="text-purple-500 shrink-0" />
+                        <div className="flex-1 min-w-0">
+                            <div className="text-sm font-semibold text-gray-800 dark:text-base-content">
+                                {t('accounts.overages.title', 'AI Credits Overage')}
+                            </div>
+                            <div className="text-[11px] text-gray-500 dark:text-gray-400 leading-tight">
+                                {t(
+                                    'accounts.overages.desc',
+                                    '免费配额耗尽后，允许继续消耗账号/家庭组的 AI Credits（仅 Ultra 等具备 Credits 的账号有效）。'
+                                )}
+                            </div>
+                        </div>
+                        <input
+                            type="checkbox"
+                            className="toggle toggle-sm toggle-primary shrink-0"
+                            checked={overageOn}
+                            disabled={overageBusy}
+                            onChange={handleToggleOverage}
+                        />
+                    </div>
+
                     {/* Protected Models Section */}
                     {account.protected_models && account.protected_models.length > 0 && (
                         <div className="mb-6">

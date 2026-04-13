@@ -138,6 +138,10 @@
         "proxy_disabled_tooltip": "Esta cuenta tiene el proxy deshabilitado manualmente, no manejará solicitudes API pero permanece utilizable en la app.",
         "enable_proxy": "Habilitar Proxy",
         "disable_proxy": "Deshabilitar Proxy",
+        "overages": {
+            "title": "Sobreconsumo de AI Credits",
+            "desc": "Una vez agotada la cuota gratuita, continúa consumiendo los AI Credits de la cuenta/grupo familiar (requiere plan Ultra)."
+        },
         "enable_proxy_selected": "Habilitar ({{count}})",
         "disable_proxy_selected": "Deshabilitar ({{count}})",
         "proxy_disabled_reason_manual": "Deshabilitado manualmente por el usuario",

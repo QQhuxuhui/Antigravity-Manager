@@ -138,6 +138,10 @@
         "proxy_disabled_tooltip": "Akaun ini telah dinyahaktifkan proksi secara manual, ia tidak akan mengendalikan permintaan API tetapi masih boleh digunakan dalam aplikasi.",
         "enable_proxy": "Aktifkan Proksi",
         "disable_proxy": "Nyahaktifkan Proksi",
+        "overages": {
+            "title": "Limpahan AI Credits",
+            "desc": "Selepas kuota percuma habis, terus guna AI Credits akaun/kumpulan keluarga (memerlukan langganan Ultra)."
+        },
         "enable_proxy_selected": "Aktifkan ({{count}})",
         "disable_proxy_selected": "Nyahaktifkan ({{count}})",
         "proxy_disabled_reason_manual": "Dinyahaktifkan secara manual oleh pengguna",

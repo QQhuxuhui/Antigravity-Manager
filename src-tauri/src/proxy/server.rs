@@ -146,6 +146,8 @@ struct AccountResponse {
     validation_blocked: bool,
     validation_blocked_until: Option<i64>,
     validation_blocked_reason: Option<String>,
+    /// [NEW] AI Credits Overage 开关
+    overages_enabled: bool,
     quota: Option<QuotaResponse>,
     device_bound: bool,
     last_used: i64,
@@ -207,6 +209,7 @@ fn to_account_response(
         validation_blocked: account.validation_blocked,
         validation_blocked_until: account.validation_blocked_until,
         validation_blocked_reason: account.validation_blocked_reason.clone(),
+        overages_enabled: account.overages_enabled,
     }
 }
 
@@ -610,6 +613,10 @@ impl AxumServer {
                 "/accounts/:accountId/toggle-proxy",
                 post(admin_toggle_proxy_status),
             )
+            .route(
+                "/accounts/:accountId/toggle-overages",
+                post(admin_toggle_overages_enabled),
+            )
             .route("/accounts/warmup", post(admin_warm_up_all_accounts))
             .route("/accounts/:accountId/warmup", post(admin_warm_up_account))
             .route("/system/data-dir", get(admin_get_data_dir_path))
@@ -853,6 +860,7 @@ async fn admin_list_accounts(
                 validation_blocked: acc.validation_blocked,
                 validation_blocked_until: acc.validation_blocked_until,
                 validation_blocked_reason: acc.validation_blocked_reason,
+                overages_enabled: acc.overages_enabled,
                 quota,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
@@ -930,6 +938,7 @@ async fn admin_get_current_account(
                 validation_blocked: acc.validation_blocked,
                 validation_blocked_until: acc.validation_blocked_until,
                 validation_blocked_reason: acc.validation_blocked_reason,
+                overages_enabled: acc.overages_enabled,
                 quota,
                 device_bound: acc.device_profile.is_some(),
                 last_used: acc.last_used,
@@ -2321,6 +2330,30 @@ async fn admin_toggle_proxy_status(
         payload.reason.as_deref(),
     )
     .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+
+    // 同步到运行中的反代服务
+    let _ = state.token_manager.reload_account(&account_id).await;
+
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToggleOveragesRequest {
+    enabled: bool,
+}
+
+async fn admin_toggle_overages_enabled(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Json(payload): Json<ToggleOveragesRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::modules::account::set_overages_enabled(&account_id, payload.enabled).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),

@@ -879,6 +879,38 @@ pub async fn toggle_proxy_status(
     Ok(())
 }
 
+/// 切换账号的 AI Credits Overage 开关。
+///
+/// 打开后，该账号在免费配额耗尽时会通过追加 `enabledCreditTypes: ["GOOGLE_ONE_AI"]`
+/// 让 Google 继续消耗账号或家庭组的 AI Credits。
+#[tauri::command]
+pub async fn toggle_overages_enabled(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    modules::logger::log_info(&format!(
+        "切换账号 overages_enabled: {} -> {}",
+        account_id, enabled
+    ));
+
+    modules::account::set_overages_enabled(&account_id, enabled)?;
+
+    // 同步到内存中的 token pool
+    {
+        let instance_lock = proxy_state.instance.read().await;
+        if let Some(instance) = instance_lock.as_ref() {
+            instance
+                .token_manager
+                .reload_account(&account_id)
+                .await
+                .map_err(|e| format!("同步账号失败: {}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// 预热所有可用账号
 #[tauri::command]
 pub async fn warm_up_all_accounts() -> Result<String, String> {

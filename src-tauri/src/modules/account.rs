@@ -1510,6 +1510,18 @@ pub fn toggle_proxy_status(
     Ok(())
 }
 
+/// 切换账号的 AI Credits Overage 开关（typed，保持 JSON schema 稳定）。
+pub fn set_overages_enabled(account_id: &str, enabled: bool) -> Result<(), String> {
+    let _lock = ACCOUNT_INDEX_LOCK
+        .lock()
+        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+
+    let mut account = load_account(account_id)?;
+    account.overages_enabled = enabled;
+    save_account(&account)?;
+    Ok(())
+}
+
 /// Find account ID by email (from index)
 pub fn find_account_id_by_email(email: &str) -> Option<String> {
     load_account_index().ok()?.accounts.into_iter()

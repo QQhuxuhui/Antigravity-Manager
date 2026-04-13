@@ -137,6 +137,10 @@
         "proxy_disabled_tooltip": "此帳號已被手動停用反向代理功能,不參與 API 請求,但仍可在應用程式中使用",
         "enable_proxy": "啟用反向代理",
         "disable_proxy": "停用反向代理",
+        "overages": {
+            "title": "AI Credits 溢出",
+            "desc": "免費配額耗盡後，允許繼續消耗帳號/家庭群組的 AI Credits（需 Ultra 等具備 Credits 的訂閱）。"
+        },
         "enable_proxy_selected": "啟用 ({{count}})",
         "disable_proxy_selected": "停用 ({{count}})",
         "proxy_disabled_reason_manual": "使用者手動停用",

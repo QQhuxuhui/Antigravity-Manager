@@ -215,8 +215,18 @@ pub async fn handle_chat_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         // 4. 转换请求 (返回内容包含 session_id 和 message_count)
-        let (gemini_body, session_id, message_count) =
+        let (mut gemini_body, session_id, message_count) =
             transform_openai_request(&openai_req, &project_id, &mapped_model, proxy_token.as_ref());
+
+        // [NEW] AI Credits Overage 注入
+        if token_manager.is_overages_enabled_by_email(&email) {
+            crate::proxy::credits_overage::inject_enabled_credit_types(&mut gemini_body);
+            tracing::debug!(
+                "[{}] overages_enabled for {} — injected enabledCreditTypes (openai)",
+                trace_id,
+                crate::proxy::upstream::client::mask_email(&email)
+            );
+        }
 
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({

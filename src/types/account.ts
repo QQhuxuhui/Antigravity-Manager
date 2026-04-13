@@ -18,6 +18,9 @@ export interface Account {
     validation_blocked_until?: number;
     validation_blocked_reason?: string;
     validation_url?: string;
+    /** 若开启，上游请求体会追加 enabledCreditTypes: ["GOOGLE_ONE_AI"]
+     *  使 Google 在免费配额耗尽后继续消耗 AI Credits（仅对 Ultra 家庭组等可用）。*/
+    overages_enabled?: boolean;
     created_at: number;
     last_used: number;
 }

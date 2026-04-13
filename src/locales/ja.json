@@ -144,6 +144,10 @@
         "proxy_disabled_tooltip": "このアカウントは手動でプロキシが無効に設定されています。APIリクエストは処理しませんが、アプリ内では引き続き使用可能です。",
         "enable_proxy": "プロキシを有効化",
         "disable_proxy": "プロキシを無効化",
+        "overages": {
+            "title": "AI Credits オーバー消費",
+            "desc": "無料枠を使い切った後、アカウント/ファミリーの AI Credits を継続消費します（Ultra 等の Credits 付きプラン必須）。"
+        },
         "enable_proxy_selected": "有効化 ({{count}})",
         "disable_proxy_selected": "無効化 ({{count}})",
         "proxy_disabled_reason_manual": "ユーザーにより手動で無効化",

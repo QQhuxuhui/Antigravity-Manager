@@ -60,6 +60,14 @@ pub struct Account {
     /// 用户自定义标签
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_label: Option<String>,
+    /// [NEW] AI Credits 溢出（Overages）开关。
+    /// 打开后，代理层会在每次 v1internal 请求体中追加
+    /// `enabledCreditTypes: ["GOOGLE_ONE_AI"]`（与 Antigravity IDE 用户开启同名
+    /// 开关时发送的字段一致）。Google 会先消耗免费配额，配额耗尽后自动消耗
+    /// 账号或家庭组的 AI Credits。Credits 也耗尽时返回 429，由现有限流流程
+    /// 自然处理（账号轮换 / 退避），无新增重试逻辑。
+    #[serde(default)]
+    pub overages_enabled: bool,
 }
 
 impl Account {
@@ -89,6 +97,7 @@ impl Account {
             proxy_id: None,
             proxy_bound_at: None,
             custom_label: None,
+            overages_enabled: false,
         }
     }
 

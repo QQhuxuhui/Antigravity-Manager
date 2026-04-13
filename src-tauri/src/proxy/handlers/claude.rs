@@ -796,7 +796,7 @@ pub async fn handle_messages(
         // let _trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
 
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let gemini_body = match transform_claude_request_in(&request_with_mapped, &project_id, retried_without_thinking, Some(account_id.as_str()), &session_id_str, token_obj.as_ref()) {
+        let mut gemini_body = match transform_claude_request_in(&request_with_mapped, &project_id, retried_without_thinking, Some(account_id.as_str()), &session_id_str, token_obj.as_ref()) {
             Ok(b) => {
                 debug!("[{}] Transformed Gemini Body: {}", trace_id, serde_json::to_string_pretty(&b).unwrap_or_default());
                 b
@@ -820,6 +820,18 @@ pub async fn handle_messages(
             }
         };
 
+        // [NEW] AI Credits Overage: 若账号开启了 overage，向请求体注入
+        // enabledCreditTypes，使 Google 在免费配额耗尽后消耗 AI Credits。
+        // 在 debug 日志之前注入，方便排查实际发出的 body。
+        if token_manager.is_overages_enabled_by_email(&email) {
+            crate::proxy::credits_overage::inject_enabled_credit_types(&mut gemini_body);
+            tracing::debug!(
+                "[{}] overages_enabled for {} — injected enabledCreditTypes",
+                trace_id,
+                mask_email(&email)
+            );
+        }
+
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({
                 "kind": "v1internal_request",
@@ -833,7 +845,7 @@ pub async fn handle_messages(
             });
             debug_logger::write_debug_payload(&debug_cfg, Some(&trace_id), "v1internal_request", &payload).await;
         }
-        
+
     // 4. 上游调用 - 自动转换逻辑
     let client_wants_stream = request.stream;
     // [AUTO-CONVERSION] 非 Stream 请求自动转换为 Stream 以享受更宽松的配额
