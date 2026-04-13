@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Bot } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Bot, Coins, DollarSign } from 'lucide-react';
 import { Account } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
@@ -7,6 +7,7 @@ import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
 import { MODEL_CONFIG, sortModels } from '../../config/modelConfig';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
+import { AccountCostSummary, getAccountCostSummary } from '../../services/accountService';
 
 interface AccountCardProps {
     account: Account;
@@ -35,6 +36,13 @@ const DEFAULT_MODELS = Object.entries(MODEL_CONFIG).map(([id, config]) => ({
     Icon: config.Icon
 }));
 
+/** Format a USD amount: <$0.01 shows "< $0.01", else 2 decimals with $ sign. */
+function formatUsd(v: number): string {
+    if (!Number.isFinite(v) || v <= 0) return '$0.00';
+    if (v < 0.01) return '< $0.01';
+    return '$' + v.toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 2 });
+}
+
 function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountCardProps) {
     const { t } = useTranslation();
     const { config, showAllQuotas } = useConfigStore();
@@ -44,6 +52,27 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
     // 自定义标签编辑状态
     const [isEditingLabel, setIsEditingLabel] = useState(false);
     const [labelInput, setLabelInput] = useState(account.custom_label || '');
+
+    // 7 天滚动 USD 消耗（今日单值 + 悬停展开明细）
+    //
+    // 自刷新必要性：
+    //   1. proxy 侧记录 token 时不会回写 account.last_used，靠依赖数组无法感知新流量
+    //   2. 定价表是启动后异步从 GitHub 拉的，首次查询可能拿到 0；需要后续轮询纠正
+    // 因此采用固定 30s 轮询 + 切换账号立即刷新。
+    const [costSummary, setCostSummary] = useState<AccountCostSummary | null>(null);
+    const [costHovered, setCostHovered] = useState(false);
+    useEffect(() => {
+        let cancelled = false;
+        const fetchOnce = () => {
+            getAccountCostSummary(account.email, 7)
+                .then((s) => { if (!cancelled) setCostSummary(s); })
+                .catch(() => { /* ignore: empty db / not yet recorded */ });
+        };
+        fetchOnce();
+        const timer = window.setInterval(fetchOnce, 30_000);
+        return () => { cancelled = true; window.clearInterval(timer); };
+    }, [account.email]);
+    const costTodayLabel = costSummary ? formatUsd(costSummary.today_usd) : null;
 
     // Use the prop directly from parent component
     const isCurrent = propIsCurrent;
@@ -198,6 +227,54 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                     );
                                 }
                             })()}
+                            {/* AI Credits 余额（每条单独一枚 chip，家庭组共享/个人分别显示） */}
+                            {account.quota?.ai_credits?.map((credit, idx) => {
+                                const label = credit.credit_type
+                                    ? t(`accounts.ai_credits.type.${credit.credit_type}`, { defaultValue: credit.credit_type })
+                                    : t('accounts.ai_credits.label', 'AI Credits');
+                                const formatted = Number.isFinite(credit.amount)
+                                    ? credit.amount.toLocaleString(undefined, { maximumFractionDigits: 2 })
+                                    : String(credit.amount);
+                                return (
+                                    <span
+                                        key={`credit-${idx}`}
+                                        title={`${label}: ${formatted}`}
+                                        className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 text-[9px] font-bold shadow-sm border border-amber-200/60 dark:border-amber-800/50"
+                                    >
+                                        <Coins className="w-2.5 h-2.5" />
+                                        {label} {formatted}
+                                    </span>
+                                );
+                            })}
+                            {/* 今日 USD 消耗（悬停显示最近 7 天明细） */}
+                            {costTodayLabel && (
+                                <span
+                                    className="relative flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 text-[9px] font-bold shadow-sm border border-emerald-200/60 dark:border-emerald-800/50 cursor-default"
+                                    title={t('accounts.cost.today_title', 'Today (USD)')}
+                                    onMouseEnter={() => setCostHovered(true)}
+                                    onMouseLeave={() => setCostHovered(false)}
+                                >
+                                    <DollarSign className="w-2.5 h-2.5" />
+                                    {costTodayLabel}
+                                    {costHovered && costSummary && (
+                                        <div
+                                            className="absolute top-full left-0 mt-1 z-20 w-48 rounded-md bg-white dark:bg-base-200 shadow-lg border border-gray-200 dark:border-white/10 p-2 font-normal text-[10px] text-gray-700 dark:text-gray-200"
+                                            onClick={(e) => e.stopPropagation()}
+                                        >
+                                            <div className="font-semibold mb-1 flex items-center justify-between">
+                                                <span>{t('accounts.cost.last_7_days', 'Last 7 days')}</span>
+                                                <span className="text-emerald-600 dark:text-emerald-400">{formatUsd(costSummary.total_usd)}</span>
+                                            </div>
+                                            {costSummary.daily.map((d) => (
+                                                <div key={d.date} className="flex items-center justify-between py-0.5">
+                                                    <span className="font-mono text-gray-500 dark:text-gray-400">{d.date.slice(5)}</span>
+                                                    <span className="tabular-nums">{formatUsd(d.cost_usd)}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </span>
+                            )}
                             {/* 自定义标签 */}
                             {account.custom_label && (
                                 <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[9px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">

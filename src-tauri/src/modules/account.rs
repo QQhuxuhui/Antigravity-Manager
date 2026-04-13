@@ -1542,12 +1542,9 @@ pub fn mark_account_forbidden(account_id: &str, reason: &str) -> Result<(), Stri
         q.forbidden_reason = Some(reason.to_string());
     } else {
         account.quota = Some(crate::models::QuotaData {
-            models: Vec::new(),
-            last_updated: chrono::Utc::now().timestamp(),
-            subscription_tier: None,
             is_forbidden: true,
             forbidden_reason: Some(reason.to_string()),
-            model_forwarding_rules: std::collections::HashMap::new(),
+            ..Default::default()
         });
     }
 

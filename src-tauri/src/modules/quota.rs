@@ -90,6 +90,22 @@ struct Tier {
     name: Option<String>,
     #[allow(dead_code)]
     slug: Option<String>,
+    #[serde(rename = "availableCredits", default)]
+    available_credits: Option<Vec<AvailableCredit>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AvailableCredit {
+    #[serde(rename = "creditType")]
+    credit_type: Option<String>,
+    #[serde(rename = "creditAmount")]
+    credit_amount: Option<String>,
+    #[serde(rename = "minimumCreditAmountForUsage")]
+    minimum_amount: Option<String>,
+}
+
+fn parse_credit_amount(s: &Option<String>) -> Option<f64> {
+    s.as_ref().and_then(|v| v.trim().parse::<f64>().ok())
 }
 
 /// Get shared HTTP Client (15s timeout) for pure info fetching (No JA3)
@@ -113,8 +129,22 @@ async fn create_long_standard_client(account_id: Option<&str>) -> rquest::Client
 
 const CLOUD_CODE_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
-/// Fetch project ID and subscription tier
-async fn fetch_project_id(access_token: &str, email: &str, account_id: Option<&str>) -> (Option<String>, Option<String>) {
+/// Result of a `loadCodeAssist` call.
+///
+/// `Some(inner)` means the upstream responded successfully — the inner fields
+/// are authoritative (including `None` / empty, which means the account really
+/// has no paid tier or no credits).
+///
+/// `None` means the call failed (network error / HTTP error / parse error).
+/// Callers should **not** overwrite previously known tier / credits in this
+/// case — a transient blip must not erase the UI badges.
+type LoadAssistResult = Option<(Option<String>, Option<String>, Vec<crate::models::quota::AiCredit>)>;
+
+/// Fetch project ID, subscription tier, and AI Credits balance (paid tier).
+///
+/// Returns `None` on any failure so callers can decide to preserve prior state
+/// instead of blindly blanking the fields.
+async fn fetch_project_id(access_token: &str, email: &str, account_id: Option<&str>) -> LoadAssistResult {
     let client = create_standard_client(account_id).await;
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
@@ -165,8 +195,20 @@ async fn fetch_project_id(access_token: &str, email: &str, account_id: Option<&s
                             "📊 [{}] Subscription identified successfully: {}", email, tier
                         ));
                     }
-                    
-                    return (project_id, subscription_tier);
+
+                    // Extract AI Credits balance from paidTier.availableCredits
+                    let ai_credits = data.paid_tier.as_ref()
+                        .and_then(|t| t.available_credits.as_ref())
+                        .map(|list| {
+                            list.iter().map(|c| crate::models::quota::AiCredit {
+                                credit_type: c.credit_type.clone(),
+                                amount: parse_credit_amount(&c.credit_amount).unwrap_or(0.0),
+                                minimum_amount: parse_credit_amount(&c.minimum_amount),
+                            }).collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+
+                    return Some((project_id, subscription_tier, ai_credits));
                 }
             } else {
                 crate::modules::logger::log_warn(&format!(
@@ -178,8 +220,23 @@ async fn fetch_project_id(access_token: &str, email: &str, account_id: Option<&s
             crate::modules::logger::log_error(&format!("❌ [{}] loadCodeAssist network error: {}", email, e));
         }
     }
-    
-    (None, None)
+
+    None
+}
+
+/// Load the previously persisted (`subscription_tier`, `ai_credits`) for an
+/// account so a failed `loadCodeAssist` call doesn't blank the UI badges.
+fn previous_tier_and_credits(
+    account_id: Option<&str>,
+) -> (Option<String>, Vec<crate::models::quota::AiCredit>) {
+    let Some(id) = account_id else { return (None, Vec::new()); };
+    match crate::modules::account::load_account(id) {
+        Ok(acc) => match acc.quota {
+            Some(q) => (q.subscription_tier, q.ai_credits),
+            None => (None, Vec::new()),
+        },
+        Err(_) => (None, Vec::new()),
+    }
 }
 
 /// Unified entry point for fetching account quota
@@ -196,12 +253,19 @@ pub async fn fetch_quota_with_cache(
 ) -> crate::error::AppResult<(QuotaData, Option<String>)> {
     use crate::error::AppError;
     
-    // Optimization: Skip loadCodeAssist call if project_id is cached to save API quota
-    let (project_id, subscription_tier) = if let Some(pid) = cached_project_id {
-        (Some(pid.to_string()), None)
-    } else {
-        fetch_project_id(access_token, email, account_id).await
-    };
+    // Always call loadCodeAssist: it is the only source of tier info + AI Credits balance,
+    // both of which need to stay fresh on every quota refresh. A transient failure must
+    // not blank the previously known tier / credits, so we fall back to the values already
+    // persisted on the account when the call did not complete.
+    let (fetched_project_id, subscription_tier, ai_credits) =
+        match fetch_project_id(access_token, email, account_id).await {
+            Some((pid, tier, credits)) => (pid, tier, credits),
+            None => {
+                let (prev_tier, prev_credits) = previous_tier_and_credits(account_id);
+                (None, prev_tier, prev_credits)
+            }
+        };
+    let project_id = fetched_project_id.or_else(|| cached_project_id.map(|s| s.to_string()));
     
     // We keep project_id to store in the DB, but we NO LONGER force inject it into payload if it's absent
     
@@ -238,6 +302,7 @@ pub async fn fetch_quota_with_cache(
                         let mut q = QuotaData::new();
                         q.is_forbidden = true;
                         q.subscription_tier = subscription_tier.clone();
+                        q.ai_credits = ai_credits.clone();
                         return Ok((q, project_id.clone()));
                     }
                     
@@ -303,9 +368,10 @@ pub async fn fetch_quota_with_cache(
                     }
                 }
                 
-                // Set subscription tier
+                // Set subscription tier and AI Credits balance
                 quota_data.subscription_tier = subscription_tier.clone();
-                
+                quota_data.ai_credits = ai_credits.clone();
+
                 return Ok((quota_data, project_id.clone()));
             },
             Err(e) => {
@@ -356,7 +422,9 @@ pub async fn get_valid_token_for_warmup(account: &crate::models::account::Accoun
     }
     
     // Fetch project_id
-    let (project_id, _) = fetch_project_id(&account.token.access_token, &account.email, Some(&account.id)).await;
+    let project_id = fetch_project_id(&account.token.access_token, &account.email, Some(&account.id))
+        .await
+        .and_then(|(pid, _, _)| pid);
     let final_pid = project_id.unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
     
     Ok((account.token.access_token, final_pid))

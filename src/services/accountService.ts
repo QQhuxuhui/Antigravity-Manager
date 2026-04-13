@@ -44,6 +44,27 @@ export async function fetchAccountQuota(accountId: string): Promise<QuotaData> {
     return await invoke('fetch_account_quota', { accountId });
 }
 
+export interface AccountDailyCost {
+    date: string;       // YYYY-MM-DD local
+    cost_usd: number;
+    total_tokens: number;
+}
+
+export interface AccountCostSummary {
+    account_email: string;
+    today_usd: number;
+    total_usd: number;
+    daily: AccountDailyCost[];
+}
+
+/** Rolling USD cost summary for one account (defaults to last 7 days). */
+export async function getAccountCostSummary(
+    accountEmail: string,
+    days: number = 7,
+): Promise<AccountCostSummary> {
+    return await invoke('get_account_cost_summary', { accountEmail, days });
+}
+
 export interface RefreshStats {
     total: number;
     success: number;

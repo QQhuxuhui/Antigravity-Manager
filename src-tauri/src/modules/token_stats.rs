@@ -553,6 +553,103 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
         .collect())
 }
 
+/// Per-day USD cost for a single account, derived from raw `token_usage`
+/// rows and the in-memory pricing table. No extra writes, no schema changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountDailyCost {
+    /// Local-date string `YYYY-MM-DD`
+    pub date: String,
+    pub cost_usd: f64,
+    pub total_tokens: u64,
+}
+
+/// Aggregated USD cost summary for one account over the last `days` (rolling).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountCostSummary {
+    pub account_email: String,
+    /// Cost accumulated for today's local date bucket only.
+    pub today_usd: f64,
+    /// Cost accumulated for the full `days` window.
+    pub total_usd: f64,
+    /// Per-day breakdown, oldest first, covering each of the last `days` days.
+    pub daily: Vec<AccountDailyCost>,
+}
+
+/// Compute the USD cost summary for a single account over the last `days`
+/// rolling window (including today).
+pub fn get_account_cost_summary(account_email: &str, days: i64) -> Result<AccountCostSummary, String> {
+    let conn = connect_db()?;
+    let days = days.max(1);
+    let cutoff = chrono::Local::now() - chrono::Duration::days(days - 1);
+    let cutoff_day = cutoff.format("%Y-%m-%d").to_string();
+    let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) as day,
+                    model,
+                    SUM(input_tokens) as input,
+                    SUM(output_tokens) as output
+             FROM token_usage
+             WHERE account_email = ?1
+               AND strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) >= ?2
+             GROUP BY day, model
+             ORDER BY day ASC",
+        )
+        .map_err(|e| e.to_string())?;
+
+    // (date, model, input, output)
+    let rows = stmt
+        .query_map(params![account_email, cutoff_day], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut by_day: std::collections::BTreeMap<String, (f64, u64)> =
+        std::collections::BTreeMap::new();
+
+    for row in rows {
+        let (day, model, input, output) = row.map_err(|e| e.to_string())?;
+        let cost = crate::modules::pricing::cost_usd(&model, input, output);
+        let entry = by_day.entry(day).or_insert((0.0, 0));
+        entry.0 += cost;
+        entry.1 += input + output;
+    }
+
+    // Fill in missing days with zero so the UI can render a stable 7-column strip.
+    let mut daily: Vec<AccountDailyCost> = Vec::with_capacity(days as usize);
+    for i in 0..days {
+        let d = (chrono::Local::now() - chrono::Duration::days(days - 1 - i))
+            .format("%Y-%m-%d")
+            .to_string();
+        let (cost_usd, total_tokens) = by_day.remove(&d).unwrap_or((0.0, 0));
+        daily.push(AccountDailyCost {
+            date: d,
+            cost_usd,
+            total_tokens,
+        });
+    }
+
+    let today_usd = daily
+        .iter()
+        .find(|e| e.date == today_str)
+        .map(|e| e.cost_usd)
+        .unwrap_or(0.0);
+    let total_usd = daily.iter().map(|e| e.cost_usd).sum();
+
+    Ok(AccountCostSummary {
+        account_email: account_email.to_string(),
+        today_usd,
+        total_usd,
+        daily,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

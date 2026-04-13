@@ -1061,3 +1061,12 @@ pub async fn get_token_stats_account_trend_daily(
 ) -> Result<Vec<crate::modules::token_stats::AccountTrendPoint>, String> {
     crate::modules::token_stats::get_account_trend_daily(days)
 }
+
+/// Per-account USD cost summary over a rolling `days` window (defaults to 7).
+#[tauri::command]
+pub async fn get_account_cost_summary(
+    account_email: String,
+    days: Option<i64>,
+) -> Result<crate::modules::token_stats::AccountCostSummary, String> {
+    crate::modules::token_stats::get_account_cost_summary(&account_email, days.unwrap_or(7))
+}

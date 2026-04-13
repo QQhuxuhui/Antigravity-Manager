@@ -136,11 +136,17 @@ pub fn run() {
         error!("Failed to initialize user token database: {}", e);
     }
 
+    // Preload cached LiteLLM pricing table; background refresh is kicked off
+    // later once the tokio runtime is live.
+    modules::pricing::load_cache();
+
     if is_headless {
         info!("Starting in HEADLESS mode...");
 
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         rt.block_on(async {
+            // Kick off a background refresh of the LiteLLM pricing table.
+            tokio::spawn(modules::pricing::refresh());
             // Initialize states manually
             // [FIX] Initialize log bridge for headless mode
             // Pass a dummy app handle or None since we don't have a Tauri app handle in headless mode
@@ -318,6 +324,9 @@ pub fn run() {
 
             // Initialize log bridge with app handle for debug console
             modules::log_bridge::init_log_bridge(app.handle().clone());
+
+            // Kick off a background refresh of the LiteLLM pricing table.
+            tauri::async_runtime::spawn(modules::pricing::refresh());
 
             // Linux: Workaround for transparent window crash/freeze
             // The transparent window feature is unstable on Linux with WebKitGTK
@@ -536,6 +545,7 @@ pub fn run() {
             commands::get_token_stats_model_trend_daily,
             commands::get_token_stats_account_trend_hourly,
             commands::get_token_stats_account_trend_daily,
+            commands::get_account_cost_summary,
             proxy::cli_sync::get_cli_sync_status,
             proxy::cli_sync::execute_cli_sync,
             proxy::cli_sync::execute_cli_restore,

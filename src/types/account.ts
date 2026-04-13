@@ -41,6 +41,17 @@ export interface QuotaData {
     forbidden_reason?: string;
     subscription_tier?: string;  // 订阅类型: FREE/PRO/ULTRA
     model_forwarding_rules?: Record<string, string>; // 废弃模型转发表
+    /** paid tier 下的 AI Credits 余额列表；free 账号为空数组 */
+    ai_credits?: AiCredit[];
+}
+
+export interface AiCredit {
+    /** credit 种类，如 GOOGLE_ONE_AI / 家庭组共享 */
+    credit_type?: string;
+    /** 剩余点数 */
+    amount: number;
+    /** 使用门槛 */
+    minimum_amount?: number;
 }
 
 export interface ModelQuota {

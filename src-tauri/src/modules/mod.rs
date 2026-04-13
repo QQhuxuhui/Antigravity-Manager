@@ -14,6 +14,7 @@ pub mod device;
 pub mod update_checker;
 pub mod scheduler;
 pub mod token_stats;
+pub mod pricing;
 pub mod cloudflared;
 pub mod integration;
 pub mod account_service;

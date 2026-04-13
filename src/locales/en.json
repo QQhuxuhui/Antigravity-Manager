@@ -152,6 +152,16 @@
             "title": "AI Credits Overage",
             "desc": "After free quota is exhausted, allow consuming the account/family AI Credits to keep serving (requires Ultra or similar Credits-eligible plan)."
         },
+        "ai_credits": {
+            "label": "AI Credits",
+            "type": {
+                "GOOGLE_ONE_AI": "AI Credits"
+            }
+        },
+        "cost": {
+            "today_title": "Today (USD)",
+            "last_7_days": "Last 7 days"
+        },
         "enable_proxy_selected": "Enable ({{count}})",
         "disable_proxy_selected": "Disable ({{count}})",
         "proxy_disabled_reason_manual": "Disabled manually by user",
