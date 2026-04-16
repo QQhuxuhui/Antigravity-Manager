@@ -470,17 +470,29 @@ impl TokenManager {
             .and_then(|q| self.calculate_quota_stats(q));
             // .filter(|&r| r > 0); // 移除 >0 过滤，因为 0% 也是有效数据，只是优先级低
 
+        // [Overage Bypass] 开启 AI Credits Overage 的账号在免费配额耗尽后
+        // 仍可通过 credits 续用，调度器不应将其按 protected_models 过滤掉。
+        // 磁盘文件保留 protected_models 原状，供 UI 展示配额状态。
+        let overages_enabled = account
+            .get("overages_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // 【新增 #621】提取受限模型列表
-        let protected_models: HashSet<String> = account
-            .get("protected_models")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let protected_models: HashSet<String> = if overages_enabled {
+            HashSet::new()
+        } else {
+            account
+                .get("protected_models")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
 
         let health_score = self.health_scores.get(&account_id).map(|v| *v).unwrap_or(1.0);
 
@@ -540,7 +552,7 @@ impl TokenManager {
             validation_url: account.get("validation_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
             model_quotas,
             model_limits,
-            overages_enabled: account.get("overages_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            overages_enabled,
         }))
     }
 
@@ -616,13 +628,19 @@ impl TokenManager {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+        // [Overage Bypass] 账号开启 overage 时永远不触发新的磁盘级保护，
+        // 并走 restore 分支清理历史遗留的 protected_models 条目，避免 UI 误显"锁定"。
+        let overages_enabled = account_json
+            .get("overages_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let mut changed = false;
 
         for std_id in &config.monitored_models {
             // 获取该组的最低百分比，如果账号没该组型号则视为 100%
             let min_pct = group_min_percentage.get(std_id).cloned().unwrap_or(100);
 
-            if min_pct <= threshold {
+            if min_pct <= threshold && !overages_enabled {
                 // 只要组内有一个不行，触发全组保护
                 if self
                     .trigger_quota_protection(
@@ -639,11 +657,11 @@ impl TokenManager {
                     changed = true;
                 }
             } else {
-                // 只有全组都好（或者没这型号），才尝试从之前受限状态恢复
+                // 配额回升 OR overage 开启 → 尝试清理旧的保护标记
                 let protected_models = account_json
                     .get("protected_models")
                     .and_then(|v| v.as_array());
-                
+
                 let is_protected = protected_models.map_or(false, |arr| {
                     arr.iter().any(|m| m.as_str() == Some(std_id as &str))
                 });
@@ -2746,6 +2764,12 @@ mod tests {
                     "expiry_timestamp": now + 3600,
                     "project_id": format!("pid-{}", id)
                 },
+                // [Test fixture] 通过能力过滤所需：model_quotas 必须包含请求目标模型。
+                "quota": {
+                    "models": [
+                        { "name": "gemini-1.5-flash", "percentage": 90 }
+                    ]
+                },
                 "disabled": false,
                 "proxy_disabled": proxy_disabled,
                 "proxy_disabled_reason": if proxy_disabled { "manual" } else { "" },
@@ -3489,5 +3513,126 @@ mod tests {
             vec!["free@test.com", "pro_high@test.com", "ultra_high@test.com", "pro_low@test.com", "ultra_low@test.com"],
             "Sonnet should sort by quota first, then by tier as tiebreaker"
         );
+    }
+
+    /// Overage 开关开启时，调度器应忽略 protected_models（内存中置空），
+    /// 让 credits 覆盖的账号继续被选中；未开启 overage 的账号保持原有过滤。
+    #[tokio::test]
+    async fn test_load_account_clears_protected_models_when_overage_enabled() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-overage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str, overages_enabled: bool| {
+            let account_path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": format!("pid-{}", id)
+                },
+                // protected_models 存在磁盘文件里，模拟免费配额耗尽后触发的保护态。
+                "protected_models": ["claude"],
+                "disabled": false,
+                "proxy_disabled": false,
+                "overages_enabled": overages_enabled,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&account_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account("acc_overage", "overage@test.com", true);
+        write_account("acc_normal", "normal@test.com", false);
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        let overage_token = manager.tokens.get("acc_overage").expect("overage account loaded");
+        assert!(overage_token.overages_enabled);
+        assert!(
+            overage_token.protected_models.is_empty(),
+            "overage=true 时内存中的 protected_models 应被置空，实际: {:?}",
+            overage_token.protected_models
+        );
+
+        let normal_token = manager.tokens.get("acc_normal").expect("normal account loaded");
+        assert!(!normal_token.overages_enabled);
+        assert!(
+            normal_token.protected_models.contains("claude"),
+            "overage=false 时 protected_models 应保持原状，实际: {:?}",
+            normal_token.protected_models
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    /// 端到端：在调度器过滤层验证，磁盘写了 protected_models 且开启了
+    /// quota_protection 时，P2C 仍会选中开了 overage 的账号。
+    #[tokio::test]
+    async fn test_p2c_selects_overage_account_over_protected_normal_account() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-overage-p2c-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str, overages_enabled: bool| {
+            let account_path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": format!("pid-{}", id)
+                },
+                "protected_models": ["claude"],
+                "disabled": false,
+                "proxy_disabled": false,
+                "overages_enabled": overages_enabled,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&account_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account("acc_overage", "overage@test.com", true);
+        write_account("acc_normal", "normal@test.com", false);
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        // 模拟 get_token 在 quota_protection 开启时的 P2C 过滤。
+        let candidates: Vec<ProxyToken> = manager
+            .tokens
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        let selected = manager.select_with_p2c(&candidates, &HashSet::new(), "claude", true);
+
+        let picked = selected.expect("P2C 应能在 overage 账号池里选出候选");
+        assert_eq!(
+            picked.email, "overage@test.com",
+            "开启 quota_protection 时，P2C 应跳过 protected_models 命中的普通账号，\
+             选中 overage 账号；实际选中 {}",
+            picked.email
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

@@ -1409,10 +1409,14 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
                     }
                 }
 
+                // [Overage Bypass] 账号开启 overage 时永远不触发新的保护，
+                // 并清理历史遗留的 protected_models，避免 UI 误显"锁定"。
+                let overages_enabled = account.overages_enabled;
+
                 for std_id in &config.quota_protection.monitored_models {
                     let min_pct = group_min_percentage.get(std_id).cloned().unwrap_or(100);
 
-                    if min_pct <= threshold {
+                    if min_pct <= threshold && !overages_enabled {
                         if !account.protected_models.contains(std_id) {
                             crate::modules::logger::log_info(&format!(
                                 "[Quota] Triggering model protection: {} (Group: {} Min: {}% <= Thres: {}%)",
@@ -1422,9 +1426,14 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
                         }
                     } else {
                         if account.protected_models.contains(std_id) {
+                            let reason = if overages_enabled {
+                                "overage enabled"
+                            } else {
+                                "quota recovered"
+                            };
                             crate::modules::logger::log_info(&format!(
-                                "[Quota] Model protection recovered: {} (Group: {} Min: {}% > Thres: {}%)",
-                                account.email, std_id, min_pct, threshold
+                                "[Quota] Model protection recovered: {} (Group: {} Min: {}%, Thres: {}%, Reason: {})",
+                                account.email, std_id, min_pct, threshold, reason
                             ));
                             account.protected_models.remove(std_id);
                         }

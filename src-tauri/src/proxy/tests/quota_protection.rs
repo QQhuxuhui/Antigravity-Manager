@@ -40,6 +40,7 @@ mod tests {
             validation_url: None,
             model_quotas: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
+            overages_enabled: false,
         }
     }
 
@@ -1145,6 +1146,7 @@ mod tests {
             validation_url: None,
             model_quotas: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
+            overages_enabled: false,
         }
     }
 }
