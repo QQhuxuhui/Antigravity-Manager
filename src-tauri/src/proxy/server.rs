@@ -159,6 +159,10 @@ struct QuotaResponse {
     last_updated: i64,
     subscription_tier: Option<String>,
     is_forbidden: bool,
+    /// paid tier 下的 AI Credits 余额列表；free 账号为空数组。
+    /// 字段缺失会让前端积分 chip 无法渲染。
+    #[serde(default)]
+    ai_credits: Vec<crate::models::quota::AiCredit>,
 }
 
 #[derive(Serialize)]
@@ -203,6 +207,7 @@ fn to_account_response(
             last_updated: q.last_updated,
             subscription_tier: q.subscription_tier.clone(),
             is_forbidden: q.is_forbidden,
+            ai_credits: q.ai_credits.clone(),
         }),
         device_bound: account.device_profile.is_some(),
         last_used: account.last_used,
@@ -606,6 +611,7 @@ impl AxumServer {
                 get(admin_get_token_stats_account_trend_daily),
             )
             .route("/accounts/bulk-delete", post(admin_delete_accounts))
+            .route("/accounts/cost-summary", get(admin_get_account_cost_summary))
             .route("/accounts/export", post(admin_export_accounts))
             .route("/accounts/reorder", post(admin_reorder_accounts))
             .route("/accounts/:accountId/quota", get(admin_fetch_account_quota))
@@ -843,6 +849,7 @@ async fn admin_list_accounts(
                 last_updated: q.last_updated,
                 subscription_tier: q.subscription_tier,
                 is_forbidden: q.is_forbidden,
+                ai_credits: q.ai_credits,
             });
 
             AccountResponse {
@@ -921,6 +928,7 @@ async fn admin_get_current_account(
                 last_updated: q.last_updated,
                 subscription_tier: q.subscription_tier,
                 is_forbidden: q.is_forbidden,
+                ai_credits: q.ai_credits,
             });
 
             AccountResponse {
@@ -2007,6 +2015,38 @@ async fn admin_get_token_stats_by_account(
 
     match res {
         Ok(Ok(stats)) => Ok(Json(stats)),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AccountCostSummaryQuery {
+    account_email: String,
+    days: Option<i64>,
+}
+
+async fn admin_get_account_cost_summary(
+    Query(p): Query<AccountCostSummaryQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let days = p.days.unwrap_or(7);
+    let account_email = p.account_email;
+    let res = tokio::task::spawn_blocking(move || {
+        token_stats::get_account_cost_summary(&account_email, days)
+    })
+    .await;
+
+    match res {
+        Ok(Ok(summary)) => Ok(Json(summary)),
         Ok(Err(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),

@@ -86,6 +86,7 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_token_stats_model_trend_daily': { url: '/api/stats/token/model-trend/daily', method: 'GET' },
   'get_token_stats_account_trend_hourly': { url: '/api/stats/token/account-trend/hourly', method: 'GET' },
   'get_token_stats_account_trend_daily': { url: '/api/stats/token/account-trend/daily', method: 'GET' },
+  'get_account_cost_summary': { url: '/api/accounts/cost-summary', method: 'GET' },
   'clear_token_stats': { url: '/api/stats/token/clear', method: 'POST' },
 
   // System
