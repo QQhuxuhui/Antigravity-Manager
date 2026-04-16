@@ -8,6 +8,7 @@ import { QuotaItem } from './QuotaItem';
 import { MODEL_CONFIG, sortModels } from '../../config/modelConfig';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { AccountCostSummary, getAccountCostSummary } from '../../services/accountService';
+import OverageToggleIconButton from './OverageToggleIconButton';
 
 interface AccountCardProps {
     account: Account;
@@ -429,6 +430,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                     >
                         <Download className="w-3.5 h-3.5" />
                     </button>
+                    <OverageToggleIconButton account={account} />
                     <button
                         className={cn(
                             "p-1.5 rounded-lg transition-all",

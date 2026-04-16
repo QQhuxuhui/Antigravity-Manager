@@ -50,6 +50,7 @@ import { Account } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 import { AccountCostSummary, getAccountCostSummary } from '../../services/accountService';
+import OverageToggleIconButton from './OverageToggleIconButton';
 
 function formatUsd(v: number): string {
     if (!Number.isFinite(v) || v <= 0) return '$0.00';
@@ -721,6 +722,7 @@ function AccountRowContent({
                     >
                         <Download className="w-3.5 h-3.5" />
                     </button>
+                    <OverageToggleIconButton account={account} />
                     <button
                         className={cn(
                             "p-1.5 rounded-lg transition-all",

@@ -147,7 +147,9 @@
         "disable_proxy": "禁用反代",
         "overages": {
             "title": "AI Credits 溢出",
-            "desc": "免费配额耗尽后，允许继续消耗账号/家庭组的 AI Credits（需 Ultra 等具备 Credits 的订阅）。"
+            "desc": "免费配额耗尽后，允许继续消耗账号/家庭组的 AI Credits（需 Ultra 等具备 Credits 的订阅）。",
+            "enable_tooltip": "开启 AI Credits 溢出（免费配额耗尽后继续消耗 Credits）",
+            "disable_tooltip": "关闭 AI Credits 溢出（不再使用 Credits 兜底）"
         },
         "ai_credits": {
             "label": "AI Credits",

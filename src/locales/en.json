@@ -150,7 +150,9 @@
         "disable_proxy": "Disable Proxy",
         "overages": {
             "title": "AI Credits Overage",
-            "desc": "After free quota is exhausted, allow consuming the account/family AI Credits to keep serving (requires Ultra or similar Credits-eligible plan)."
+            "desc": "After free quota is exhausted, allow consuming the account/family AI Credits to keep serving (requires Ultra or similar Credits-eligible plan).",
+            "enable_tooltip": "Enable AI Credits overage (keep serving via Credits after free quota runs out)",
+            "disable_tooltip": "Disable AI Credits overage (no longer fall back to Credits)"
         },
         "ai_credits": {
             "label": "AI Credits",
