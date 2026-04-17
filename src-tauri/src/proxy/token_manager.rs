@@ -1556,10 +1556,20 @@ impl TokenManager {
                 Some(t) => t,
                 None => {
                     // 乐观重置策略: 双层防护机制
-                    // 计算最短等待时间
+                    // 计算最短等待时间。
+                    // [Bug #2] 必须用 model-aware 的 get_remaining_wait，
+                    // 否则只能看到账号级 key，而 QUOTA_EXHAUSTED 写的是 "account_id:model"
+                    // 模型级 key（参见 rate_limit.rs::parse_from_error）。一旦看不见，
+                    // min_wait 永远 None，错误路径误报 "failed or unhealthy" 且
+                    // 缓冲延迟 / 乐观重置全部跳过。
                     let min_wait = tokens_snapshot
                         .iter()
-                        .filter_map(|t| self.rate_limit_tracker.get_reset_seconds(&t.account_id))
+                        .filter_map(|t| {
+                            let w = self
+                                .rate_limit_tracker
+                                .get_remaining_wait(&t.account_id, Some(&normalized_target));
+                            if w > 0 { Some(w) } else { None }
+                        })
                         .min();
 
                     // Layer 1: 如果最短等待时间 <= 2秒,执行缓冲延迟
@@ -3631,6 +3641,86 @@ mod tests {
             "开启 quota_protection 时，P2C 应跳过 protected_models 命中的普通账号，\
              选中 overage 账号；实际选中 {}",
             picked.email
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    /// 回归测试 (Bug #2)：当所有账号都因 QUOTA_EXHAUSTED 被锁在"模型级" key
+    /// (`account_id:model`) 而非账号级 key 时，调度器错误路径必须能看到这些锁，
+    /// 返回 "All accounts limited. Wait Xs." 而不是误报 "All accounts failed or unhealthy."。
+    /// 后者会让调用方误以为账号挂了，且 5h 自动恢复路径不会被触发。
+    #[tokio::test]
+    async fn test_error_path_sees_model_level_quota_locks() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-model-lock-err-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str| {
+            let account_path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": format!("pid-{}", id)
+                },
+                // 必须能通过能力过滤：normalize_to_standard_id("claude-opus-4-7") == "claude"。
+                "quota": {
+                    "models": [
+                        { "name": "claude-opus-4-7", "percentage": 50 }
+                    ]
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&account_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account("acc1", "a@test.com");
+        write_account("acc2", "b@test.com");
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        // 模拟上游对每个账号都返回 QUOTA_EXHAUSTED；parse_from_error 在
+        // QuotaExhausted+Some(model) 路径下会写入 "account_id:model" 的模型级 key。
+        // 这里直接用归一化后的 "claude"，与生产代码 set_precise_lockout 行为一致。
+        let body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
+        let backoff = vec![60u64, 300, 1800, 7200];
+        manager.rate_limit_tracker.parse_from_error(
+            "acc1", 429, Some("60"), body, Some("claude".to_string()), &backoff,
+        );
+        manager.rate_limit_tracker.parse_from_error(
+            "acc2", 429, Some("60"), body, Some("claude".to_string()), &backoff,
+        );
+
+        // 两个账号都被模型级锁住后，错误路径应当报告"还要等多久"，而不是
+        // "failed or unhealthy"。target 指定 claude-opus-4-7，归一化后正好命中 claude 锁。
+        let err = manager
+            .get_token("claude", false, None, "claude-opus-4-7")
+            .await
+            .expect_err("期望错误：所有账号都被模型级 QUOTA_EXHAUSTED 锁住");
+
+        assert!(
+            !err.contains("failed or unhealthy"),
+            "Bug #2: 错误路径不应误报 'failed or unhealthy'，实际错误: {}",
+            err
+        );
+        assert!(
+            err.contains("limited") && err.contains("Wait"),
+            "Bug #2: 错误路径应报告 'All accounts limited. Wait Xs.'，实际错误: {}",
+            err
         );
 
         let _ = std::fs::remove_dir_all(&tmp_root);
