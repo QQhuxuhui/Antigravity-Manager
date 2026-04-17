@@ -115,6 +115,15 @@ impl TokenManager {
     }
 
     /// 从主应用账号目录加载所有账号
+    ///
+    /// [Bug #3] 关键不变量：在调用过程中 `self.tokens` **绝不能**被观察到为空。
+    /// 旧实现 `self.tokens.clear()` 后再 async 逐个 `load_single_account`，
+    /// 整个窗口可达数百毫秒到秒级，期间所有 `get_token` 都会拿到
+    /// "Token pool is empty" 直接 503。
+    ///
+    /// 现在改为：先把新池子完整地构建到本地变量里（期间 `self.tokens` 保持旧状态服务），
+    /// 再做"先 upsert 再 retain"的覆盖式刷新——这样新账号先就位、旧账号才被剔除，
+    /// `self.tokens` 永远是新旧交集 ∪ 新账号的非空超集（首次冷启动除外）。
     pub async fn load_accounts(&self) -> Result<usize, String> {
         let accounts_dir = self.data_dir.join("accounts");
 
@@ -122,18 +131,11 @@ impl TokenManager {
             return Err(format!("账号目录不存在: {:?}", accounts_dir));
         }
 
-        // Reload should reflect current on-disk state (accounts can be added/removed/disabled).
-        self.tokens.clear();
-        self.current_index.store(0, Ordering::SeqCst);
-        {
-            let mut last_used = self.last_used_account.lock().await;
-            *last_used = None;
-        }
-
         let entries = std::fs::read_dir(&accounts_dir)
             .map_err(|e| format!("读取账号目录失败: {}", e))?;
 
-        let mut count = 0;
+        // 先在本地变量里构建新池子，期间不触碰 self.tokens。
+        let mut new_pool: HashMap<String, ProxyToken> = HashMap::new();
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
@@ -143,12 +145,9 @@ impl TokenManager {
                 continue;
             }
 
-            // 尝试加载账号
             match self.load_single_account(&path).await {
                 Ok(Some(token)) => {
-                    let account_id = token.account_id.clone();
-                    self.tokens.insert(account_id, token);
-                    count += 1;
+                    new_pool.insert(token.account_id.clone(), token);
                 }
                 Ok(None) => {
                     // 跳过无效账号
@@ -157,6 +156,22 @@ impl TokenManager {
                     tracing::debug!("加载账号失败 {:?}: {}", path, e);
                 }
             }
+        }
+
+        let count = new_pool.len();
+
+        // 覆盖式刷新：先 upsert 新数据（确保新账号即时可见），
+        // 再 retain 掉不再存在于磁盘的旧账号。两步都不会让池子瞬时为空。
+        let new_keys: HashSet<String> = new_pool.keys().cloned().collect();
+        for (k, v) in new_pool {
+            self.tokens.insert(k, v);
+        }
+        self.tokens.retain(|k, _| new_keys.contains(k));
+
+        self.current_index.store(0, Ordering::SeqCst);
+        {
+            let mut last_used = self.last_used_account.lock().await;
+            *last_used = None;
         }
 
         Ok(count)
@@ -3722,6 +3737,93 @@ mod tests {
             "Bug #2: 错误路径应报告 'All accounts limited. Wait Xs.'，实际错误: {}",
             err
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    /// 回归测试 (Bug #3)：load_accounts 不能在 reload 过程中暴露"空池子"窗口。
+    /// 旧实现先 self.tokens.clear() 再 async 逐个 load_single_account，
+    /// 每个账号都涉及文件 I/O，整个窗口可达数百毫秒到秒级，期间所有
+    /// get_token 都会拿到 "Token pool is empty" 直接 503。
+    #[tokio::test]
+    async fn test_load_accounts_does_not_expose_empty_pool_during_reload() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Arc;
+
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-load-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str| {
+            let account_path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": format!("pid-{}", id)
+                },
+                "quota": {
+                    "models": [
+                        { "name": "gemini-1.5-flash", "percentage": 90 }
+                    ]
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&account_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        // 写若干账号——数量越多，旧实现的"clear 后慢慢回填"窗口越长，越易复现。
+        for i in 0..20 {
+            write_account(&format!("acc{}", i), &format!("user{}@test.com", i));
+        }
+
+        let manager = Arc::new(TokenManager::new(tmp_root.clone()));
+        manager.load_accounts().await.unwrap();
+        assert_eq!(manager.tokens.len(), 20, "首次 load 应得到 20 个账号");
+
+        // 后台读 token 池：在 reload 期间持续观察，统计被看到 0 个账号的次数。
+        let stop = Arc::new(AtomicBool::new(false));
+        let empty_observations = Arc::new(AtomicUsize::new(0));
+
+        let m_reader = Arc::clone(&manager);
+        let stop_reader = Arc::clone(&stop);
+        let empty_reader = Arc::clone(&empty_observations);
+        let reader_handle = tokio::spawn(async move {
+            while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                if m_reader.tokens.is_empty() {
+                    empty_reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // 反复 reload，给 reader 充分机会去捕捉 clear 后的瞬间。
+        for _ in 0..10 {
+            manager.load_accounts().await.unwrap();
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader_handle.await.unwrap();
+
+        let observed_empty = empty_observations.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            observed_empty, 0,
+            "Bug #3: load_accounts 不应暴露空池子窗口；实际观察到 {} 次空状态",
+            observed_empty
+        );
+        assert_eq!(manager.tokens.len(), 20, "reload 完成后池子大小应保持 20");
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
