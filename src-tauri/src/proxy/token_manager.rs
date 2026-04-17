@@ -122,8 +122,13 @@ impl TokenManager {
     /// "Token pool is empty" 直接 503。
     ///
     /// 现在改为：先把新池子完整地构建到本地变量里（期间 `self.tokens` 保持旧状态服务），
-    /// 再做"先 upsert 再 retain"的覆盖式刷新——这样新账号先就位、旧账号才被剔除，
-    /// `self.tokens` 永远是新旧交集 ∪ 新账号的非空超集（首次冷启动除外）。
+    /// 再做"先 upsert 再 retain"的覆盖式刷新——这样新账号先就位、旧账号才被剔除。
+    ///
+    /// [Bug #3 复审] 关键决策：retain 的依据必须是 **磁盘目录列表**（账号 ID 集合），
+    /// 而不是"本轮成功加载的账号"。否则一旦撞上 update_account_quota 之类的
+    /// 批量原子重写，所有 read+parse 都会瞬时 Err，successful 集合为空，retain
+    /// 把整个池子清光，503 风暴复发。文件存在 = 账号应当存在；
+    /// load 失败只是错过一次刷新机会，不是删除信号。
     pub async fn load_accounts(&self) -> Result<usize, String> {
         let accounts_dir = self.data_dir.join("accounts");
 
@@ -134,9 +139,10 @@ impl TokenManager {
         let entries = std::fs::read_dir(&accounts_dir)
             .map_err(|e| format!("读取账号目录失败: {}", e))?;
 
-        // 先在本地变量里构建新池子，期间不触碰 self.tokens。
-        let mut new_pool: HashMap<String, ProxyToken> = HashMap::new();
-
+        // 一次性扫描出磁盘上所有账号文件路径 + 推导出 account_id 集合，
+        // 后者作为 retain 的真值（与 reload_account 的命名约定 {account_id}.json 一致）。
+        let mut account_paths: Vec<PathBuf> = Vec::new();
+        let mut expected_account_ids: HashSet<String> = HashSet::new();
         for entry in entries {
             let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
             let path = entry.path();
@@ -145,14 +151,30 @@ impl TokenManager {
                 continue;
             }
 
-            match self.load_single_account(&path).await {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                expected_account_ids.insert(stem.to_string());
+            }
+            account_paths.push(path);
+        }
+
+        // 把成功加载的账号攒到本地变量里；瞬时失败只是错过一次刷新，不会被记成 "已删除"。
+        let mut new_pool: HashMap<String, ProxyToken> = HashMap::new();
+
+        for path in &account_paths {
+            match self.load_single_account(path).await {
                 Ok(Some(token)) => {
                     new_pool.insert(token.account_id.clone(), token);
                 }
                 Ok(None) => {
-                    // 跳过无效账号
+                    // 账号被显式标记为 disabled / 不可用 —— load_single_account 主动返回 None，
+                    // 视为"应当从内存中剔除"，所以从期望集合里也去掉。
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        expected_account_ids.remove(stem);
+                    }
                 }
                 Err(e) => {
+                    // 文件存在但 read/parse 失败：可能是另一个写入者半途的瞬时态，
+                    // 也可能是真坏掉了。两种情况都不在本轮处理：保留旧条目，等下一轮重试。
                     tracing::debug!("加载账号失败 {:?}: {}", path, e);
                 }
             }
@@ -161,12 +183,12 @@ impl TokenManager {
         let count = new_pool.len();
 
         // 覆盖式刷新：先 upsert 新数据（确保新账号即时可见），
-        // 再 retain 掉不再存在于磁盘的旧账号。两步都不会让池子瞬时为空。
-        let new_keys: HashSet<String> = new_pool.keys().cloned().collect();
+        // 再 retain 掉不再存在于磁盘的旧账号。
+        // 关键：retain 依据是 expected_account_ids（基于磁盘列表），不是 new_pool（成功加载的子集）。
         for (k, v) in new_pool {
             self.tokens.insert(k, v);
         }
-        self.tokens.retain(|k, _| new_keys.contains(k));
+        self.tokens.retain(|k, _| expected_account_ids.contains(k));
 
         self.current_index.store(0, Ordering::SeqCst);
         {
@@ -3824,6 +3846,88 @@ mod tests {
             observed_empty
         );
         assert_eq!(manager.tokens.len(), 20, "reload 完成后池子大小应保持 20");
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    /// 回归测试 (Bug #3 复审)：reload 期间若 *所有* load_single_account 都因
+    /// 瞬时文件 I/O / JSON 半写入而 Err（例如批量重写正在进行中），
+    /// 旧实现的 retain(new_keys) 会让 new_keys 为空进而清空整个池子，
+    /// 重新出现 "Token pool is empty" 503。
+    /// 修复后：磁盘上账号文件仍然存在 ⇒ 内存中对应条目必须保留，
+    /// 哪怕本轮加载没拿到任何新数据。
+    #[tokio::test]
+    async fn test_load_accounts_preserves_pool_on_transient_load_failures() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-load-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let write_valid_account = |id: &str, email: &str| {
+            let account_path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": format!("pid-{}", id)
+                },
+                "quota": {
+                    "models": [
+                        { "name": "gemini-1.5-flash", "percentage": 90 }
+                    ]
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&account_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        // 1. 首次加载得到一个完整的池子。
+        for i in 0..5 {
+            write_valid_account(&format!("acc{}", i), &format!("user{}@test.com", i));
+        }
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+        assert_eq!(manager.tokens.len(), 5, "首次加载应得到 5 个账号");
+
+        // 2. 模拟 "正在批量原子重写" 的瞬时窗口：所有文件被半写入的非法 JSON 覆盖。
+        //    文件依然存在于磁盘（dir 列表能看到），但 read+parse 都会 Err。
+        for i in 0..5 {
+            let p = accounts_dir.join(format!("acc{}.json", i));
+            std::fs::write(&p, b"{ \"id\": \"acc").unwrap(); // 半写入
+        }
+
+        // 3. 再次 reload。Err 路径会让 new_pool 为空，但磁盘上文件仍在 ⇒
+        //    内存中的旧条目应当被保留。
+        manager.load_accounts().await.unwrap();
+        assert_eq!(
+            manager.tokens.len(),
+            5,
+            "Bug #3 复审：所有 load_single_account 瞬时失败时，磁盘上仍存在的账号 \
+             条目必须被保留；否则会出现 'Token pool is empty' 503。实际 len={}",
+            manager.tokens.len()
+        );
+
+        // 4. 真正被删除的账号文件应当被清出内存（区分"瞬时失败"与"已删除"）。
+        std::fs::remove_file(accounts_dir.join("acc0.json")).unwrap();
+        // 让其它 4 个文件恢复有效内容，模拟"删除事务完成"
+        for i in 1..5 {
+            write_valid_account(&format!("acc{}", i), &format!("user{}@test.com", i));
+        }
+        manager.load_accounts().await.unwrap();
+        assert_eq!(manager.tokens.len(), 4, "acc0 文件已删除，应从内存中移除");
+        assert!(manager.tokens.get("acc0").is_none(), "acc0 应被清除");
+        assert!(manager.tokens.get("acc1").is_some(), "acc1 应仍在");
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
