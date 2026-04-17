@@ -353,22 +353,17 @@ pub async fn handle_generate(
                             Some(Ok(b)) => b,
                             Some(Err(e)) => {
                                 error!("[Gemini-SSE] Stream error: {}", e);
+                                // [FIX] Gemini 原生 SSE 不使用 OpenAI chat.completion.chunk schema，
+                                // 也不以 `[DONE]` 作终止符；与正常路径 (line ~420) yield 的 candidates[] JSON
+                                // 保持同一协议，否则 SDK 解析失败或把错误文本当成模型输出。
                                 let error_json = serde_json::json!({
-                                    "id": &s_id_for_stream,
-                                    "object": "chat.completion.chunk",
-                                    "model": &model_name_for_stream,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "content": format!("\n[Stream Error] {}", e)
-                                            },
-                                            "finish_reason": "error"
-                                        }
-                                    ]
+                                    "error": {
+                                        "code": 500,
+                                        "status": "INTERNAL",
+                                        "message": format!("Stream error: {}", e)
+                                    }
                                 });
                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
-                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
                                 break;
                             }
                             None => break,
