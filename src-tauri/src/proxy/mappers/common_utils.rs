@@ -335,7 +335,11 @@ fn calculate_aspect_ratio_from_size(size: &str) -> &'static str {
     "1:1" // 默认回退
 }
 
-/// Inject current googleSearch tool and ensure no duplicate legacy search tools
+/// Inject current googleSearch tool and ensure no duplicate legacy search tools.
+///
+/// Gemini v1internal 对混合工具（functionDeclarations + googleSearch）有严格要求：
+/// 只有 Gemini 2.0+ / 2.5 / 3.x 系列确认支持，老模型（1.5 及以下）同时下发会被 400 拒绝。
+/// 参照 `claude/request.rs::build_tools` 的同等白名单。
 pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
     if let Some(obj) = body.as_object_mut() {
         let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
@@ -345,14 +349,30 @@ pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
                     .map_or(false, |o| o.contains_key("functionDeclarations"))
             });
 
-            // [FIX] v1internal (cloudcode-pa) does NOT support mixing googleSearch
-            // with functionDeclarations — it lacks includeServerSideToolInvocations.
-            // Skip googleSearch injection entirely when function tools are present.
+            // [FIX] 只有在老模型同时带有 functionDeclarations 时才跳过注入，
+            // 避免误杀 Gemini 2.0/2.5/3.x 的 -online + function calling 组合。
             if has_functions {
-                tracing::debug!(
-                    "Skipping googleSearch injection: functionDeclarations present (v1internal incompatible)"
+                let supports_mixed_tools = mapped_model
+                    .map(|m| {
+                        let lower = m.to_lowercase();
+                        lower.contains("gemini-2.0")
+                            || lower.contains("gemini-2.5")
+                            || lower.contains("gemini-3")
+                    })
+                    .unwrap_or(false);
+
+                if !supports_mixed_tools {
+                    tracing::debug!(
+                        "Skipping googleSearch injection: functionDeclarations present on legacy model {:?} (mixed tools not supported)",
+                        mapped_model
+                    );
+                    return;
+                }
+
+                tracing::info!(
+                    "[Common-Utils] Enabling MIXED tools (functionDeclarations + googleSearch) for {:?}",
+                    mapped_model
                 );
-                return;
             }
 
             // 首先清理掉已存在的 googleSearch 或 googleSearchRetrieval，以防重复产生冲突
