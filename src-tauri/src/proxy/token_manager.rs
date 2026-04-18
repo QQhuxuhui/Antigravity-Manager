@@ -115,6 +115,20 @@ impl TokenManager {
     }
 
     /// 从主应用账号目录加载所有账号
+    ///
+    /// [Bug #3] 关键不变量：在调用过程中 `self.tokens` **绝不能**被观察到为空。
+    /// 旧实现 `self.tokens.clear()` 后再 async 逐个 `load_single_account`，
+    /// 整个窗口可达数百毫秒到秒级，期间所有 `get_token` 都会拿到
+    /// "Token pool is empty" 直接 503。
+    ///
+    /// 现在改为：先把新池子完整地构建到本地变量里（期间 `self.tokens` 保持旧状态服务），
+    /// 再做"先 upsert 再 retain"的覆盖式刷新——这样新账号先就位、旧账号才被剔除。
+    ///
+    /// [Bug #3 复审] 关键决策：retain 的依据必须是 **磁盘目录列表**（账号 ID 集合），
+    /// 而不是"本轮成功加载的账号"。否则一旦撞上 update_account_quota 之类的
+    /// 批量原子重写，所有 read+parse 都会瞬时 Err，successful 集合为空，retain
+    /// 把整个池子清光，503 风暴复发。文件存在 = 账号应当存在；
+    /// load 失败只是错过一次刷新机会，不是删除信号。
     pub async fn load_accounts(&self) -> Result<usize, String> {
         let accounts_dir = self.data_dir.join("accounts");
 
@@ -122,19 +136,13 @@ impl TokenManager {
             return Err(format!("账号目录不存在: {:?}", accounts_dir));
         }
 
-        // Reload should reflect current on-disk state (accounts can be added/removed/disabled).
-        self.tokens.clear();
-        self.current_index.store(0, Ordering::SeqCst);
-        {
-            let mut last_used = self.last_used_account.lock().await;
-            *last_used = None;
-        }
-
         let entries = std::fs::read_dir(&accounts_dir)
             .map_err(|e| format!("读取账号目录失败: {}", e))?;
 
-        let mut count = 0;
-
+        // 一次性扫描出磁盘上所有账号文件路径 + 推导出 account_id 集合，
+        // 后者作为 retain 的真值（与 reload_account 的命名约定 {account_id}.json 一致）。
+        let mut account_paths: Vec<PathBuf> = Vec::new();
+        let mut expected_account_ids: HashSet<String> = HashSet::new();
         for entry in entries {
             let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
             let path = entry.path();
@@ -143,20 +151,49 @@ impl TokenManager {
                 continue;
             }
 
-            // 尝试加载账号
-            match self.load_single_account(&path).await {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                expected_account_ids.insert(stem.to_string());
+            }
+            account_paths.push(path);
+        }
+
+        // 把成功加载的账号攒到本地变量里；瞬时失败只是错过一次刷新，不会被记成 "已删除"。
+        let mut new_pool: HashMap<String, ProxyToken> = HashMap::new();
+
+        for path in &account_paths {
+            match self.load_single_account(path).await {
                 Ok(Some(token)) => {
-                    let account_id = token.account_id.clone();
-                    self.tokens.insert(account_id, token);
-                    count += 1;
+                    new_pool.insert(token.account_id.clone(), token);
                 }
                 Ok(None) => {
-                    // 跳过无效账号
+                    // 账号被显式标记为 disabled / 不可用 —— load_single_account 主动返回 None，
+                    // 视为"应当从内存中剔除"，所以从期望集合里也去掉。
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        expected_account_ids.remove(stem);
+                    }
                 }
                 Err(e) => {
+                    // 文件存在但 read/parse 失败：可能是另一个写入者半途的瞬时态，
+                    // 也可能是真坏掉了。两种情况都不在本轮处理：保留旧条目，等下一轮重试。
                     tracing::debug!("加载账号失败 {:?}: {}", path, e);
                 }
             }
+        }
+
+        let count = new_pool.len();
+
+        // 覆盖式刷新：先 upsert 新数据（确保新账号即时可见），
+        // 再 retain 掉不再存在于磁盘的旧账号。
+        // 关键：retain 依据是 expected_account_ids（基于磁盘列表），不是 new_pool（成功加载的子集）。
+        for (k, v) in new_pool {
+            self.tokens.insert(k, v);
+        }
+        self.tokens.retain(|k, _| expected_account_ids.contains(k));
+
+        self.current_index.store(0, Ordering::SeqCst);
+        {
+            let mut last_used = self.last_used_account.lock().await;
+            *last_used = None;
         }
 
         Ok(count)
@@ -1556,10 +1593,20 @@ impl TokenManager {
                 Some(t) => t,
                 None => {
                     // 乐观重置策略: 双层防护机制
-                    // 计算最短等待时间
+                    // 计算最短等待时间。
+                    // [Bug #2] 必须用 model-aware 的 get_remaining_wait，
+                    // 否则只能看到账号级 key，而 QUOTA_EXHAUSTED 写的是 "account_id:model"
+                    // 模型级 key（参见 rate_limit.rs::parse_from_error）。一旦看不见，
+                    // min_wait 永远 None，错误路径误报 "failed or unhealthy" 且
+                    // 缓冲延迟 / 乐观重置全部跳过。
                     let min_wait = tokens_snapshot
                         .iter()
-                        .filter_map(|t| self.rate_limit_tracker.get_reset_seconds(&t.account_id))
+                        .filter_map(|t| {
+                            let w = self
+                                .rate_limit_tracker
+                                .get_remaining_wait(&t.account_id, Some(&normalized_target));
+                            if w > 0 { Some(w) } else { None }
+                        })
                         .min();
 
                     // Layer 1: 如果最短等待时间 <= 2秒,执行缓冲延迟
@@ -3632,6 +3679,255 @@ mod tests {
              选中 overage 账号；实际选中 {}",
             picked.email
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    /// 回归测试 (Bug #2)：当所有账号都因 QUOTA_EXHAUSTED 被锁在"模型级" key
+    /// (`account_id:model`) 而非账号级 key 时，调度器错误路径必须能看到这些锁，
+    /// 返回 "All accounts limited. Wait Xs." 而不是误报 "All accounts failed or unhealthy."。
+    /// 后者会让调用方误以为账号挂了，且 5h 自动恢复路径不会被触发。
+    #[tokio::test]
+    async fn test_error_path_sees_model_level_quota_locks() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-model-lock-err-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str| {
+            let account_path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": format!("pid-{}", id)
+                },
+                // 必须能通过能力过滤：normalize_to_standard_id("claude-opus-4-7") == "claude"。
+                "quota": {
+                    "models": [
+                        { "name": "claude-opus-4-7", "percentage": 50 }
+                    ]
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&account_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        write_account("acc1", "a@test.com");
+        write_account("acc2", "b@test.com");
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+
+        // 模拟上游对每个账号都返回 QUOTA_EXHAUSTED；parse_from_error 在
+        // QuotaExhausted+Some(model) 路径下会写入 "account_id:model" 的模型级 key。
+        // 这里直接用归一化后的 "claude"，与生产代码 set_precise_lockout 行为一致。
+        let body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
+        let backoff = vec![60u64, 300, 1800, 7200];
+        manager.rate_limit_tracker.parse_from_error(
+            "acc1", 429, Some("60"), body, Some("claude".to_string()), &backoff,
+        );
+        manager.rate_limit_tracker.parse_from_error(
+            "acc2", 429, Some("60"), body, Some("claude".to_string()), &backoff,
+        );
+
+        // 两个账号都被模型级锁住后，错误路径应当报告"还要等多久"，而不是
+        // "failed or unhealthy"。target 指定 claude-opus-4-7，归一化后正好命中 claude 锁。
+        let err = manager
+            .get_token("claude", false, None, "claude-opus-4-7")
+            .await
+            .expect_err("期望错误：所有账号都被模型级 QUOTA_EXHAUSTED 锁住");
+
+        assert!(
+            !err.contains("failed or unhealthy"),
+            "Bug #2: 错误路径不应误报 'failed or unhealthy'，实际错误: {}",
+            err
+        );
+        assert!(
+            err.contains("limited") && err.contains("Wait"),
+            "Bug #2: 错误路径应报告 'All accounts limited. Wait Xs.'，实际错误: {}",
+            err
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    /// 回归测试 (Bug #3)：load_accounts 不能在 reload 过程中暴露"空池子"窗口。
+    /// 旧实现先 self.tokens.clear() 再 async 逐个 load_single_account，
+    /// 每个账号都涉及文件 I/O，整个窗口可达数百毫秒到秒级，期间所有
+    /// get_token 都会拿到 "Token pool is empty" 直接 503。
+    #[tokio::test]
+    async fn test_load_accounts_does_not_expose_empty_pool_during_reload() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Arc;
+
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-load-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, email: &str| {
+            let account_path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": format!("pid-{}", id)
+                },
+                "quota": {
+                    "models": [
+                        { "name": "gemini-1.5-flash", "percentage": 90 }
+                    ]
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&account_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        // 写若干账号——数量越多，旧实现的"clear 后慢慢回填"窗口越长，越易复现。
+        for i in 0..20 {
+            write_account(&format!("acc{}", i), &format!("user{}@test.com", i));
+        }
+
+        let manager = Arc::new(TokenManager::new(tmp_root.clone()));
+        manager.load_accounts().await.unwrap();
+        assert_eq!(manager.tokens.len(), 20, "首次 load 应得到 20 个账号");
+
+        // 后台读 token 池：在 reload 期间持续观察，统计被看到 0 个账号的次数。
+        let stop = Arc::new(AtomicBool::new(false));
+        let empty_observations = Arc::new(AtomicUsize::new(0));
+
+        let m_reader = Arc::clone(&manager);
+        let stop_reader = Arc::clone(&stop);
+        let empty_reader = Arc::clone(&empty_observations);
+        let reader_handle = tokio::spawn(async move {
+            while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                if m_reader.tokens.is_empty() {
+                    empty_reader.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // 反复 reload，给 reader 充分机会去捕捉 clear 后的瞬间。
+        for _ in 0..10 {
+            manager.load_accounts().await.unwrap();
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader_handle.await.unwrap();
+
+        let observed_empty = empty_observations.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            observed_empty, 0,
+            "Bug #3: load_accounts 不应暴露空池子窗口；实际观察到 {} 次空状态",
+            observed_empty
+        );
+        assert_eq!(manager.tokens.len(), 20, "reload 完成后池子大小应保持 20");
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    /// 回归测试 (Bug #3 复审)：reload 期间若 *所有* load_single_account 都因
+    /// 瞬时文件 I/O / JSON 半写入而 Err（例如批量重写正在进行中），
+    /// 旧实现的 retain(new_keys) 会让 new_keys 为空进而清空整个池子，
+    /// 重新出现 "Token pool is empty" 503。
+    /// 修复后：磁盘上账号文件仍然存在 ⇒ 内存中对应条目必须保留，
+    /// 哪怕本轮加载没拿到任何新数据。
+    #[tokio::test]
+    async fn test_load_accounts_preserves_pool_on_transient_load_failures() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-load-corrupt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        let write_valid_account = |id: &str, email: &str| {
+            let account_path = accounts_dir.join(format!("{}.json", id));
+            let json = serde_json::json!({
+                "id": id,
+                "email": email,
+                "token": {
+                    "access_token": format!("atk-{}", id),
+                    "refresh_token": format!("rtk-{}", id),
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600,
+                    "project_id": format!("pid-{}", id)
+                },
+                "quota": {
+                    "models": [
+                        { "name": "gemini-1.5-flash", "percentage": 90 }
+                    ]
+                },
+                "disabled": false,
+                "proxy_disabled": false,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(&account_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+        };
+
+        // 1. 首次加载得到一个完整的池子。
+        for i in 0..5 {
+            write_valid_account(&format!("acc{}", i), &format!("user{}@test.com", i));
+        }
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+        assert_eq!(manager.tokens.len(), 5, "首次加载应得到 5 个账号");
+
+        // 2. 模拟 "正在批量原子重写" 的瞬时窗口：所有文件被半写入的非法 JSON 覆盖。
+        //    文件依然存在于磁盘（dir 列表能看到），但 read+parse 都会 Err。
+        for i in 0..5 {
+            let p = accounts_dir.join(format!("acc{}.json", i));
+            std::fs::write(&p, b"{ \"id\": \"acc").unwrap(); // 半写入
+        }
+
+        // 3. 再次 reload。Err 路径会让 new_pool 为空，但磁盘上文件仍在 ⇒
+        //    内存中的旧条目应当被保留。
+        manager.load_accounts().await.unwrap();
+        assert_eq!(
+            manager.tokens.len(),
+            5,
+            "Bug #3 复审：所有 load_single_account 瞬时失败时，磁盘上仍存在的账号 \
+             条目必须被保留；否则会出现 'Token pool is empty' 503。实际 len={}",
+            manager.tokens.len()
+        );
+
+        // 4. 真正被删除的账号文件应当被清出内存（区分"瞬时失败"与"已删除"）。
+        std::fs::remove_file(accounts_dir.join("acc0.json")).unwrap();
+        // 让其它 4 个文件恢复有效内容，模拟"删除事务完成"
+        for i in 1..5 {
+            write_valid_account(&format!("acc{}", i), &format!("user{}@test.com", i));
+        }
+        manager.load_accounts().await.unwrap();
+        assert_eq!(manager.tokens.len(), 4, "acc0 文件已删除，应从内存中移除");
+        assert!(manager.tokens.get("acc0").is_none(), "acc0 应被清除");
+        assert!(manager.tokens.get("acc1").is_some(), "acc1 应仍在");
 
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
