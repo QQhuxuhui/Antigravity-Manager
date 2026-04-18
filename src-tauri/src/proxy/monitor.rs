@@ -21,6 +21,8 @@ pub struct ProxyRequestLog {
     pub response_body: Option<String>,
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<u32>,
     pub protocol: Option<String>,     // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>,     // User token username
 }
@@ -86,8 +88,9 @@ impl ProxyMonitor {
         ) {
             let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
             let account = account.clone();
+            let cache_read = log.cache_read_tokens.unwrap_or(0);
             tokio::spawn(async move {
-                if let Err(e) = crate::modules::token_stats::record_usage(&account, &model, input, output) {
+                if let Err(e) = crate::modules::token_stats::record_usage(&account, &model, input, output, cache_read) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }
             });
@@ -153,7 +156,8 @@ impl ProxyMonitor {
                 log_to_save.output_tokens,
             ) {
                 let model = log_to_save.model.clone().unwrap_or_else(|| "unknown".to_string());
-                if let Err(e) = crate::modules::token_stats::record_usage(account, &model, input, output) {
+                let cache_read = log_to_save.cache_read_tokens.unwrap_or(0);
+                if let Err(e) = crate::modules::token_stats::record_usage(account, &model, input, output, cache_read) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }
             }
@@ -177,6 +181,7 @@ impl ProxyMonitor {
                 response_body: None, // Don't send body in event
                 input_tokens: log.input_tokens,
                 output_tokens: log.output_tokens,
+                cache_read_tokens: log.cache_read_tokens,
                 protocol: log.protocol.clone(),
                 username: log.username.clone(),
             };

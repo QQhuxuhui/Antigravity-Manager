@@ -88,11 +88,19 @@ pub fn init_db() -> Result<(), String> {
             model TEXT NOT NULL,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
-            total_tokens INTEGER NOT NULL DEFAULT 0
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )
     .map_err(|e| e.to_string())?;
+
+    // Additive migration: older DBs may lack cache_read_tokens. Ignore the
+    // "duplicate column" error so repeated init_db calls stay idempotent.
+    let _ = conn.execute(
+        "ALTER TABLE token_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
 
     // Create indexes for efficient queries
     conn.execute(
@@ -125,22 +133,26 @@ pub fn init_db() -> Result<(), String> {
     Ok(())
 }
 
-/// Record token usage from a request
+/// Record token usage from a request. `cache_read_tokens` is the count of
+/// prompt tokens served from the provider's prompt cache (Gemini
+/// `cachedContentTokenCount`, Anthropic `cache_read_input_tokens`), billed at
+/// a lower rate than fresh input.
 pub fn record_usage(
     account_email: &str,
     model: &str,
     input_tokens: u32,
     output_tokens: u32,
+    cache_read_tokens: u32,
 ) -> Result<(), String> {
     let conn = connect_db()?;
     let timestamp = chrono::Local::now().timestamp();
-    let total_tokens = input_tokens + output_tokens;
+    let total_tokens = input_tokens + output_tokens + cache_read_tokens;
 
     // Insert into raw usage table
     conn.execute(
-        "INSERT INTO token_usage (timestamp, account_email, model, input_tokens, output_tokens, total_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![timestamp, account_email, model, input_tokens, output_tokens, total_tokens],
+        "INSERT INTO token_usage (timestamp, account_email, model, input_tokens, output_tokens, total_tokens, cache_read_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![timestamp, account_email, model, input_tokens, output_tokens, total_tokens, cache_read_tokens],
     ).map_err(|e| e.to_string())?;
 
     let hour_bucket = chrono::Local::now().format("%Y-%m-%d %H:00").to_string();
@@ -589,7 +601,8 @@ pub fn get_account_cost_summary(account_email: &str, days: i64) -> Result<Accoun
             "SELECT strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) as day,
                     model,
                     SUM(input_tokens) as input,
-                    SUM(output_tokens) as output
+                    SUM(output_tokens) as output,
+                    SUM(cache_read_tokens) as cache_read
              FROM token_usage
              WHERE account_email = ?1
                AND strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) >= ?2
@@ -598,7 +611,7 @@ pub fn get_account_cost_summary(account_email: &str, days: i64) -> Result<Accoun
         )
         .map_err(|e| e.to_string())?;
 
-    // (date, model, input, output)
+    // (date, model, input, output, cache_read)
     let rows = stmt
         .query_map(params![account_email, cutoff_day], |row| {
             Ok((
@@ -606,6 +619,7 @@ pub fn get_account_cost_summary(account_email: &str, days: i64) -> Result<Accoun
                 row.get::<_, String>(1)?,
                 row.get::<_, u64>(2)?,
                 row.get::<_, u64>(3)?,
+                row.get::<_, u64>(4)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -614,11 +628,11 @@ pub fn get_account_cost_summary(account_email: &str, days: i64) -> Result<Accoun
         std::collections::BTreeMap::new();
 
     for row in rows {
-        let (day, model, input, output) = row.map_err(|e| e.to_string())?;
-        let cost = crate::modules::pricing::cost_usd(&model, input, output);
+        let (day, model, input, output, cache_read) = row.map_err(|e| e.to_string())?;
+        let cost = crate::modules::pricing::cost_usd(&model, input, output, cache_read);
         let entry = by_day.entry(day).or_insert((0.0, 0));
         entry.0 += cost;
-        entry.1 += input + output;
+        entry.1 += input + output + cache_read;
     }
 
     // Fill in missing days with zero so the UI can render a stable 7-column strip.

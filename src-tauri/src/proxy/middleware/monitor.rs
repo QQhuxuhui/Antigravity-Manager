@@ -14,6 +14,89 @@ use futures::StreamExt;
 const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB
 const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB for image responses
 
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct UsageTokens {
+    pub input: Option<u32>,
+    pub output: Option<u32>,
+    pub cache_read: Option<u32>,
+}
+
+/// Parse token usage out of a response body. Handles three dialects:
+///   - OpenAI: `usage.{prompt_tokens, completion_tokens, total_tokens}`
+///   - Anthropic: `usage.{input_tokens, output_tokens}` (cache-read stays None
+///     unless the upstream returns `cache_read_input_tokens`)
+///   - Gemini: `usageMetadata.{promptTokenCount, candidatesTokenCount,
+///     cachedContentTokenCount, thoughtsTokenCount}`
+///
+/// For Gemini this mirrors sub2api:
+///   input  = promptTokenCount - cachedContentTokenCount  (Gemini's
+///            promptTokenCount already INCLUDES cached)
+///   output = candidatesTokenCount + thoughtsTokenCount   (thinking tokens
+///            are billed as output)
+///   cache_read = cachedContentTokenCount
+pub(crate) fn parse_usage(body: &Value) -> UsageTokens {
+    let usage = body
+        .get("usage")
+        .or_else(|| body.get("usageMetadata"))
+        .or_else(|| body.get("response").and_then(|r| r.get("usage")))
+        .or_else(|| body.get("response").and_then(|r| r.get("usageMetadata")));
+
+    let Some(usage) = usage else {
+        return UsageTokens::default();
+    };
+
+    let u = |key: &str| usage.get(key).and_then(|v| v.as_u64());
+
+    // Detect Gemini shape by presence of Gemini-only keys. OpenAI/Anthropic
+    // bodies will lack promptTokenCount, so we fall through to the generic
+    // path below.
+    if usage.get("promptTokenCount").is_some()
+        || usage.get("candidatesTokenCount").is_some()
+        || usage.get("cachedContentTokenCount").is_some()
+        || usage.get("thoughtsTokenCount").is_some()
+    {
+        let prompt = u("promptTokenCount").unwrap_or(0);
+        let cached = u("cachedContentTokenCount").unwrap_or(0);
+        let candidates = u("candidatesTokenCount").unwrap_or(0);
+        let thoughts = u("thoughtsTokenCount").unwrap_or(0);
+
+        let input = prompt.saturating_sub(cached);
+        let output = candidates + thoughts;
+
+        return UsageTokens {
+            input: usage.get("promptTokenCount").map(|_| input as u32),
+            output: if candidates > 0 || thoughts > 0 {
+                Some(output as u32)
+            } else {
+                None
+            },
+            cache_read: if cached > 0 { Some(cached as u32) } else { None },
+        };
+    }
+
+    // OpenAI / Anthropic generic fallback.
+    let input = u("prompt_tokens").or_else(|| u("input_tokens"));
+    let output = u("completion_tokens").or_else(|| u("output_tokens"));
+    let cache_read = u("cache_read_input_tokens");
+
+    // Some minimal bodies only expose a `total_tokens` roll-up — preserve the
+    // pre-fix fallback of reporting it as output so downstream stats aren't 0.
+    if input.is_none() && output.is_none() {
+        let total = u("total_tokens").or_else(|| u("totalTokenCount"));
+        return UsageTokens {
+            input: None,
+            output: total.map(|v| v as u32),
+            cache_read: cache_read.map(|v| v as u32),
+        };
+    }
+
+    UsageTokens {
+        input: input.map(|v| v as u32),
+        output: output.map(|v| v as u32),
+        cache_read: cache_read.map(|v| v as u32),
+    }
+}
+
 /// Helper function to record User Token usage
 fn record_user_token_usage(
     user_token_identity: &Option<UserTokenIdentity>,
@@ -171,6 +254,7 @@ pub async fn monitor_middleware(
         response_body: None,
         input_tokens: None,
         output_tokens: None,
+        cache_read_tokens: None,
         protocol,
         username,
     };
@@ -335,32 +419,16 @@ pub async fn monitor_middleware(
                             }
                         }
                         
-                        // Token usage extraction
-                        if let Some(usage) = json.get("usage")
-                            .or(json.get("usageMetadata"))
-                            .or(json.get("response").and_then(|r| r.get("usage")))
-                        {
-                            log.input_tokens = usage.get("prompt_tokens")
-                                .or(usage.get("input_tokens"))
-                                .or(usage.get("promptTokenCount"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                            log.output_tokens = usage.get("completion_tokens")
-                                .or(usage.get("output_tokens"))
-                                .or(usage.get("candidatesTokenCount"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                            
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage.get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                            }
+                        // Token usage extraction (Gemini subtracts cached from input).
+                        let parsed = parse_usage(&json);
+                        if parsed.input.is_some() || parsed.output.is_some() || parsed.cache_read.is_some() {
+                            log.input_tokens = parsed.input;
+                            log.output_tokens = parsed.output;
+                            log.cache_read_tokens = parsed.cache_read;
                         }
                     }
                 }
-                
+
                 // Build consolidated response object
                 let mut consolidated = serde_json::Map::new();
                 
@@ -404,20 +472,11 @@ pub async fn monitor_middleware(
                         if line.starts_with("data: ") && (line.contains("\"usage\"") || line.contains("\"usageMetadata\"")) {
                             let json_str = line.trim_start_matches("data: ").trim();
                             if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                                if let Some(usage) = json.get("usage")
-                                    .or(json.get("usageMetadata"))
-                                    .or(json.get("response").and_then(|r| r.get("usage")))
-                                {
-                                    log.input_tokens = usage.get("prompt_tokens")
-                                        .or(usage.get("input_tokens"))
-                                        .or(usage.get("promptTokenCount"))
-                                        .and_then(|v| v.as_u64())
-                                        .map(|v| v as u32);
-                                    log.output_tokens = usage.get("completion_tokens")
-                                        .or(usage.get("output_tokens"))
-                                        .or(usage.get("candidatesTokenCount"))
-                                        .and_then(|v| v.as_u64())
-                                        .map(|v| v as u32);
+                                let parsed = parse_usage(&json);
+                                if parsed.input.is_some() || parsed.output.is_some() || parsed.cache_read.is_some() {
+                                    log.input_tokens = parsed.input;
+                                    log.output_tokens = parsed.output;
+                                    log.cache_read_tokens = parsed.cache_read;
                                     break;
                                 }
                             }
@@ -443,25 +502,14 @@ pub async fn monitor_middleware(
             Ok(bytes) => {
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
-                        // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
-                        if let Some(usage) = json.get("usage").or(json.get("usageMetadata")) {
-                            log.input_tokens = usage.get("prompt_tokens")
-                                .or(usage.get("input_tokens"))
-                                .or(usage.get("promptTokenCount"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                            log.output_tokens = usage.get("completion_tokens")
-                                .or(usage.get("output_tokens"))
-                                .or(usage.get("candidatesTokenCount"))
-                                .and_then(|v| v.as_u64())
-                                .map(|v| v as u32);
-                                
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage.get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                            }
+                        // OpenAI "usage" / Anthropic "usage" / Gemini "usageMetadata".
+                        // For Gemini, promptTokenCount includes cachedContentTokenCount —
+                        // parse_usage subtracts it so we don't double-bill the cached portion.
+                        let parsed = parse_usage(&json);
+                        if parsed.input.is_some() || parsed.output.is_some() || parsed.cache_read.is_some() {
+                            log.input_tokens = parsed.input;
+                            log.output_tokens = parsed.output;
+                            log.cache_read_tokens = parsed.cache_read;
                         }
                     }
                     log.response_body = Some(s.to_string());
@@ -497,5 +545,101 @@ pub async fn monitor_middleware(
 
         monitor.log_request(log).await;
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gemini_usage_subtracts_cached_from_input() {
+        // Gemini: promptTokenCount already INCLUDES cachedContentTokenCount.
+        // To avoid double-billing cache-hit tokens at full input price, we
+        // must subtract. This mirrors sub2api's behavior.
+        let body = json!({
+            "usageMetadata": {
+                "promptTokenCount": 10000,
+                "cachedContentTokenCount": 8000,
+                "candidatesTokenCount": 200
+            }
+        });
+        let u = parse_usage(&body);
+        assert_eq!(u.input, Some(2000), "input = prompt - cached");
+        assert_eq!(u.cache_read, Some(8000));
+        assert_eq!(u.output, Some(200));
+    }
+
+    #[test]
+    fn gemini_output_includes_thoughts_tokens() {
+        // Gemini 2.5 thinking models split output into candidates + thoughts.
+        // sub2api sums both as output; we must too.
+        let body = json!({
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "cachedContentTokenCount": 0,
+                "candidatesTokenCount": 100,
+                "thoughtsTokenCount": 300
+            }
+        });
+        let u = parse_usage(&body);
+        assert_eq!(u.output, Some(400), "output = candidates + thoughts");
+    }
+
+    #[test]
+    fn openai_usage_preserved() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 100
+            }
+        });
+        let u = parse_usage(&body);
+        assert_eq!(u.input, Some(500));
+        assert_eq!(u.output, Some(100));
+        assert_eq!(u.cache_read, None);
+    }
+
+    #[test]
+    fn nested_response_usage_parsed() {
+        // antigravity upstream may wrap: body.response.usageMetadata.
+        let body = json!({
+            "response": {
+                "usageMetadata": {
+                    "promptTokenCount": 1500,
+                    "cachedContentTokenCount": 500,
+                    "candidatesTokenCount": 50
+                }
+            }
+        });
+        let u = parse_usage(&body);
+        assert_eq!(u.input, Some(1000));
+        assert_eq!(u.cache_read, Some(500));
+        assert_eq!(u.output, Some(50));
+    }
+
+    #[test]
+    fn missing_usage_returns_none() {
+        let body = json!({"hello": "world"});
+        let u = parse_usage(&body);
+        assert_eq!(u.input, None);
+        assert_eq!(u.output, None);
+        assert_eq!(u.cache_read, None);
+    }
+
+    #[test]
+    fn gemini_without_cached_field_input_equals_prompt() {
+        // Non-cached Gemini call: cachedContentTokenCount absent → input = prompt.
+        let body = json!({
+            "usageMetadata": {
+                "promptTokenCount": 1234,
+                "candidatesTokenCount": 56
+            }
+        });
+        let u = parse_usage(&body);
+        assert_eq!(u.input, Some(1234));
+        assert_eq!(u.cache_read, None);
+        assert_eq!(u.output, Some(56));
     }
 }

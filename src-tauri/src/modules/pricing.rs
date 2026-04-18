@@ -146,14 +146,79 @@ pub fn lookup(model: &str) -> Option<ModelPricing> {
     None
 }
 
-/// Compute USD cost for a (model, input_tokens, output_tokens) tuple. Returns
+/// Compute USD cost for a (model, input, output, cache_read) tuple. Returns
 /// 0.0 if the model is unknown so callers don't need to handle None.
-pub fn cost_usd(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
+pub fn cost_usd(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+) -> f64 {
     match lookup(model) {
-        Some(p) => {
-            (input_tokens as f64) * p.input_cost_per_token
-                + (output_tokens as f64) * p.output_cost_per_token
-        }
+        Some(p) => compute_cost(&p, input_tokens, output_tokens, cache_read_tokens),
         None => 0.0,
+    }
+}
+
+/// Pure cost computation — extracted so it can be unit-tested without seeding
+/// the global pricing table. If the model has no explicit cache-read price,
+/// fall back to the input price (conservative: no worse than pre-fix).
+pub(crate) fn compute_cost(
+    p: &ModelPricing,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+) -> f64 {
+    let cache_price = p
+        .cache_read_input_token_cost
+        .unwrap_or(p.input_cost_per_token);
+    (input_tokens as f64) * p.input_cost_per_token
+        + (output_tokens as f64) * p.output_cost_per_token
+        + (cache_read_tokens as f64) * cache_price
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_cost_applies_cache_read_discount() {
+        // Gemini 2.5 Pro-ish: $1.25/MTok input, $10/MTok output, cache read 25% of input.
+        let p = ModelPricing {
+            input_cost_per_token: 1.25e-6,
+            output_cost_per_token: 10.0e-6,
+            cache_read_input_token_cost: Some(0.3125e-6),
+        };
+        let cost = compute_cost(&p, 1_000, 400, 8_000);
+        let expected = 1_000.0 * 1.25e-6 + 400.0 * 10.0e-6 + 8_000.0 * 0.3125e-6;
+        assert!((cost - expected).abs() < 1e-12, "got {} expected {}", cost, expected);
+    }
+
+    #[test]
+    fn compute_cost_falls_back_to_input_price_when_cache_price_missing() {
+        // If a model in the pricing table lacks a cache-read price, we don't
+        // silently drop the cached tokens — we bill them at the input price.
+        // That's the conservative choice: no worse than pre-fix behavior.
+        let p = ModelPricing {
+            input_cost_per_token: 2.0e-6,
+            output_cost_per_token: 8.0e-6,
+            cache_read_input_token_cost: None,
+        };
+        let cost = compute_cost(&p, 100, 200, 500);
+        let expected = 100.0 * 2.0e-6 + 200.0 * 8.0e-6 + 500.0 * 2.0e-6;
+        assert!((cost - expected).abs() < 1e-12, "got {} expected {}", cost, expected);
+    }
+
+    #[test]
+    fn compute_cost_no_cache_matches_old_behavior() {
+        // When cache_read_tokens = 0, cost must equal the pre-fix formula.
+        let p = ModelPricing {
+            input_cost_per_token: 3.0e-6,
+            output_cost_per_token: 15.0e-6,
+            cache_read_input_token_cost: Some(0.3e-6),
+        };
+        let cost = compute_cost(&p, 1_000, 500, 0);
+        let expected = 1_000.0 * 3.0e-6 + 500.0 * 15.0e-6;
+        assert!((cost - expected).abs() < 1e-12);
     }
 }
