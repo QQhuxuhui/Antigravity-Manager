@@ -69,6 +69,15 @@ pub fn init_db() -> Result<(), String> {
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
 
+    let request_body = log
+        .request_body
+        .as_deref()
+        .map(|s| truncate_body(s, MAX_BODY_BYTES));
+    let response_body = log
+        .response_body
+        .as_deref()
+        .map(|s| truncate_body(s, MAX_BODY_BYTES));
+
     conn.execute(
         "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, account_email, mapped_model, protocol, client_ip, username)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
@@ -81,8 +90,8 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.duration,
             log.model,
             log.error,
-            log.request_body,
-            log.response_body,
+            request_body,
+            response_body,
             log.input_tokens,
             log.output_tokens,
             log.account_email,
@@ -508,5 +517,65 @@ pub fn get_token_usage_by_ip(limit: usize, hours: i64) -> Result<Vec<IpTokenStat
     }
 
     Ok(stats)
+}
+
+/// Max bytes of a request/response body persisted to the proxy log DB.
+/// Anything longer is truncated at a UTF-8 char boundary and a marker noting
+/// the dropped byte count is appended. Keeps `proxy_logs.db` from ballooning
+/// when Antigravity long-conversation responses reach MB-scale per request.
+pub(crate) const MAX_BODY_BYTES: usize = 32 * 1024;
+
+/// Truncate `s` so the returned string is at most `max_bytes + marker` bytes
+/// long, cutting at a UTF-8 char boundary. If `s` already fits, returns it
+/// unchanged. When truncated, appends `...[truncated N bytes]` where N is the
+/// number of bytes dropped from the original.
+pub(crate) fn truncate_body(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = s.len() - cut;
+    format!("{}...[truncated {} bytes]", &s[..cut], dropped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_body_short_returns_unchanged() {
+        let s = "hello world";
+        assert_eq!(truncate_body(s, 32), s);
+    }
+
+    #[test]
+    fn truncate_body_at_limit_returns_unchanged() {
+        let s = "a".repeat(32);
+        assert_eq!(truncate_body(&s, 32), s);
+    }
+
+    #[test]
+    fn truncate_body_over_limit_appends_marker_with_dropped_bytes() {
+        let s = "a".repeat(100);
+        let out = truncate_body(&s, 32);
+        assert!(out.starts_with(&"a".repeat(32)), "prefix kept: {}", out);
+        assert!(out.contains("[truncated 68 bytes]"), "marker present: {}", out);
+    }
+
+    #[test]
+    fn truncate_body_does_not_split_multibyte_char() {
+        // Each "中" is 3 bytes in UTF-8. max_bytes = 4 would land inside the
+        // second char; must cut at the char boundary after the first one.
+        let s = "中中中".to_string(); // 9 bytes
+        let out = truncate_body(&s, 4);
+        assert!(out.starts_with("中"), "starts with first char: {}", out);
+        assert!(!out.starts_with("中中"), "second char dropped: {}", out);
+        assert!(out.contains("[truncated"), "marker present: {}", out);
+        // Output is valid UTF-8 by virtue of being a String; this would panic
+        // on construction if we sliced mid-codepoint.
+    }
 }
 

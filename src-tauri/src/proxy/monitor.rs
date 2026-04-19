@@ -49,12 +49,13 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Auto cleanup old logs (keep last 30 days)
+        // Auto cleanup old logs (keep last 7 days). Combined with per-body
+        // truncation in save_log, this caps proxy_logs.db growth.
         tokio::spawn(async {
-            match crate::modules::proxy_db::cleanup_old_logs(30) {
+            match crate::modules::proxy_db::cleanup_old_logs(7) {
                 Ok(deleted) => {
                     if deleted > 0 {
-                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
+                        tracing::info!("Auto cleanup: removed {} old logs (>7 days)", deleted);
                     }
                 }
                 Err(e) => {
