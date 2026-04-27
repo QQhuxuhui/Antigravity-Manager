@@ -11,7 +11,7 @@ use tracing::{debug, error, info};
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS;
 use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account,
+    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request};
 use crate::proxy::server::AppState;
@@ -93,6 +93,7 @@ pub async fn handle_generate(
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
+    let mut force_rotate_next = false;
 
     for attempt in 0..max_attempts {
         // 3. 模型路由解析
@@ -131,24 +132,25 @@ pub async fn handle_generate(
         // 提取 SessionId (粘性指纹)
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
-        // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
-                &config.request_type,
-                attempt > 0,
-                Some(&session_id),
-                &config.final_model,
-            )
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Token error: {}", e),
-                ));
-            }
-        };
+        let force_rotate_token = std::mem::take(&mut force_rotate_next);
+        let (access_token, project_id, email, account_id, _wait_ms, _load_guard) =
+            match token_manager
+                .get_token(
+                    &config.request_type,
+                    force_rotate_token,
+                    Some(&session_id),
+                    &config.final_model,
+                )
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Token error: {}", e),
+                    ));
+                }
+            };
 
         let mapped_model = token_manager
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
@@ -161,7 +163,14 @@ pub async fn handle_generate(
         // [FIX #765] Pass session_id to wrap_request for signature injection
         // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let mut wrapped_body = wrap_request(&body, &project_id, &mapped_model, Some(account_id.as_str()), Some(&session_id), token_obj.as_ref());
+        let mut wrapped_body = wrap_request(
+            &body,
+            &project_id,
+            &mapped_model,
+            Some(account_id.as_str()),
+            Some(&session_id),
+            token_obj.as_ref(),
+        );
 
         // [NEW] AI Credits Overage: 若账号开启了 overage，向请求体注入
         // enabledCreditTypes，使 Google 在免费配额耗尽后消耗 AI Credits。
@@ -225,6 +234,7 @@ pub async fn handle_generate(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                force_rotate_next = true;
                 debug!(
                     "Gemini Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -273,7 +283,8 @@ pub async fn handle_generate(
         let status = response.status();
 
         // [NEW] 提取官方 TraceID
-        let cloud_code_trace_id = response.headers()
+        let cloud_code_trace_id = response
+            .headers()
             .get("x-cloudaicompanion-trace-id")
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
@@ -344,6 +355,7 @@ pub async fn handle_generate(
                 }
 
                 if retry_gemini {
+                    force_rotate_next = true;
                     continue;
                 }
 
@@ -376,7 +388,7 @@ pub async fn handle_generate(
                                 Ok(next_item) => next_item,
                                 Err(_) => {
                                     error!("[Gemini-SSE] Idle timeout after 300s, terminating stream");
-                                    None 
+                                    None
                                 }
                             }
                         };
@@ -571,6 +583,11 @@ pub async fn handle_generate(
 
         // 处理错误并重试
         let status_code = status.as_u16();
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
         let error_text = response
             .text()
             .await
@@ -599,15 +616,38 @@ pub async fn handle_generate(
             .await;
         }
 
+        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
+            token_manager
+                .mark_rate_limited_async(
+                    &email,
+                    status_code,
+                    retry_after.as_deref(),
+                    &error_text,
+                    Some(&mapped_model),
+                )
+                .await;
+        }
+
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
         let trace_id = format!("gemini_{}", session_id);
 
         // 执行退避
-        if apply_retry_strategy(strategy.clone(), attempt, max_attempts, status_code, &trace_id).await {
+        if apply_retry_strategy(
+            strategy.clone(),
+            attempt,
+            max_attempts,
+            status_code,
+            &trace_id,
+        )
+        .await
+        {
             // [NEW] Apply Client Adapter "let_it_crash" strategy
             if let Some(adapter) = &client_adapter {
                 if adapter.let_it_crash() && attempt > 0 {
+                    if matches!(strategy, RetryStrategy::ModelCapacityRetry(_)) {
+                        token_manager.mark_model_capacity_cooldown_for_model(&mapped_model);
+                    }
                     tracing::warn!(
                         "[Gemini] let_it_crash active: Aborting retries after attempt {}",
                         attempt
@@ -616,18 +656,19 @@ pub async fn handle_generate(
                 }
             }
 
-            // 判断是否需要轮换账号
-        // 判断是否需要轮换账号
-        let mut force_rotate = false;
-        if !should_rotate_account(status_code, Some(&strategy)) {
-            debug!(
-                "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
-                trace_id, status_code
-            );
-            force_rotate = false;
-        } else {
-            force_rotate = true;
-        }
+            force_rotate_next = should_rotate_account(status_code, Some(&strategy));
+            if !force_rotate_next {
+                debug!(
+                    "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
+                    trace_id, status_code
+                );
+            }
+            if matches!(strategy, RetryStrategy::ModelCapacityRetry(_))
+                && attempt + 1 >= max_attempts
+            {
+                token_manager.mark_model_capacity_cooldown_for_model(&mapped_model);
+            }
+            continue;
         }
 
         // [NEW] 处理 400 错误 (Thinking 签名失效)
@@ -656,6 +697,7 @@ pub async fn handle_generate(
                 }
             }
 
+            force_rotate_next = true;
             continue; // 重试
         }
 
@@ -741,7 +783,7 @@ pub async fn handle_count_tokens(
     Json(_body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let model_group = "gemini";
-    let (_access_token, _project_id, _, _, _wait_ms) = state
+    let (_access_token, _project_id, _, _, _wait_ms, _load_guard) = state
         .token_manager
         .get_token(model_group, false, None, "gemini")
         .await

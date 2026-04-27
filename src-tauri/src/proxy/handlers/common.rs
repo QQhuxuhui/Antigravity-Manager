@@ -1,8 +1,13 @@
+use crate::proxy::server::AppState;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info};
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json, extract::State};
-use serde_json::{json, Value};
-use crate::proxy::server::AppState;
 
 // ===== 统一重试与退避策略 =====
 
@@ -19,6 +24,15 @@ pub enum RetryStrategy {
     ExponentialBackoff { base_ms: u64, max_ms: u64 },
     /// [NEW] 原地重试 (Grace Retry)：在当前账号上小窗口等待后直接重试，不计入常规切换
     GraceRetry(Duration),
+    /// 模型共享容量不足：切账号收益很低，短间隔原账号重试。
+    ModelCapacityRetry(Duration),
+}
+
+fn is_model_capacity_exhausted(error_text: &str) -> bool {
+    let lower = error_text.to_lowercase();
+    lower.contains("model_capacity_exhausted")
+        || lower.contains("model capacity")
+        || lower.contains("model_capacity")
 }
 
 /// 根据错误状态码和错误信息确定重试策略
@@ -40,15 +54,23 @@ pub fn determine_retry_strategy(
 
         // 429 限流错误
         429 => {
+            if is_model_capacity_exhausted(error_text) {
+                tracing::info!("MODEL_CAPACITY_EXHAUSTED detected on 429, retrying in place");
+                return RetryStrategy::ModelCapacityRetry(Duration::from_secs(1));
+            }
+
             // 优先使用服务端返回的 Retry-After / quotaResetDelay
             if let Some(delay_ms) = crate::proxy::upstream::retry::parse_retry_delay(error_text) {
-                // [NEW] 如果延迟在 2s 内，执行 Grace Retry (原地重试)
-                if crate::proxy::upstream::retry::should_grace_retry(delay_ms) {
-                    let actual_delay = delay_ms.saturating_add(100); // 增加 100ms 安全缓冲
-                    tracing::info!("Grace Retry Triggered: Delay {}ms is within window, using same account", actual_delay);
+                // Antigravity/Google 的短 retryDelay 通常是瞬时窗口抖动，原账号等待比切号更稳。
+                if delay_ms <= 7_000 {
+                    let actual_delay = delay_ms.saturating_add(1500); // 官方 Grace Window 缓冲
+                    tracing::info!(
+                        "Grace Retry Triggered: Delay {}ms is within window, using same account",
+                        actual_delay
+                    );
                     RetryStrategy::GraceRetry(Duration::from_millis(actual_delay))
                 } else {
-                    let actual_delay = delay_ms.saturating_add(200).min(30_000); 
+                    let actual_delay = delay_ms.saturating_add(200).min(30_000);
                     RetryStrategy::FixedDelay(Duration::from_millis(actual_delay))
                 }
             } else {
@@ -59,6 +81,14 @@ pub fn determine_retry_strategy(
 
         // 503 服务不可用 / 529 服务器过载
         503 | 529 => {
+            if is_model_capacity_exhausted(error_text) {
+                tracing::info!(
+                    "MODEL_CAPACITY_EXHAUSTED detected on {}, retrying in place",
+                    status_code
+                );
+                return RetryStrategy::ModelCapacityRetry(Duration::from_secs(1));
+            }
+
             // 指数退避：起始 10s，上限 60s (针对 Google 边缘节点过载)
             RetryStrategy::ExponentialBackoff {
                 base_ms: 10000,
@@ -94,7 +124,10 @@ pub async fn apply_retry_strategy(
 ) -> bool {
     match strategy {
         RetryStrategy::NoRetry => {
-            debug!("[{}] Non-retryable error {}, stopping", trace_id, status_code);
+            debug!(
+                "[{}] Non-retryable error {}, stopping",
+                trace_id, status_code
+            );
             false
         }
 
@@ -149,13 +182,29 @@ pub async fn apply_retry_strategy(
             sleep(duration).await;
             true // 原地重试在 handlers 层面通过 should_rotate_account 判断是否切换
         }
+
+        RetryStrategy::ModelCapacityRetry(duration) => {
+            info!(
+                "[{}] Model capacity retry: status={}, attempt={}/{}, delay={}ms",
+                trace_id,
+                status_code,
+                attempt + 1,
+                max_attempts,
+                duration.as_millis()
+            );
+            sleep(duration).await;
+            true
+        }
     }
 }
 
 /// 判断是否应该轮换账号
 pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>) -> bool {
     // [NEW] 如果识别为 Grace Retry，则显式要求不轮换账号
-    if let Some(RetryStrategy::GraceRetry(_)) = strategy {
+    if matches!(
+        strategy,
+        Some(RetryStrategy::GraceRetry(_) | RetryStrategy::ModelCapacityRetry(_))
+    ) {
         return false;
     }
 
@@ -175,7 +224,7 @@ pub async fn handle_detect_model(
     Json(body): Json<Value>,
 ) -> Response {
     let model_name = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    
+
     if model_name.is_empty() {
         return (StatusCode::BAD_REQUEST, "Missing 'model' field").into_response();
     }

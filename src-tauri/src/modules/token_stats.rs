@@ -326,6 +326,44 @@ pub fn get_account_stats(hours: i64) -> Result<Vec<AccountTokenStats>, String> {
     Ok(result)
 }
 
+/// Count successful requests for an account in a normalized model family.
+///
+/// This is intentionally used as a conservative scheduling precheck only. It
+/// must not be treated as authoritative upstream quota state because failed
+/// requests and requests made outside this app are not represented here.
+pub fn count_account_model_family_requests_since(
+    account_email: &str,
+    model_family: &str,
+    since_timestamp: i64,
+) -> Result<u64, String> {
+    let conn = connect_db()?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT model FROM token_usage
+             WHERE account_email = ?1 AND timestamp >= ?2",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map(params![account_email, since_timestamp], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut count = 0u64;
+    for row in rows {
+        let model = row.map_err(|e| e.to_string())?;
+        let normalized =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(&model).unwrap_or(model);
+        if normalized == model_family {
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
 /// Get summary statistics for a time range
 pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
     let conn = connect_db()?;
@@ -589,7 +627,10 @@ pub struct AccountCostSummary {
 
 /// Compute the USD cost summary for a single account over the last `days`
 /// rolling window (including today).
-pub fn get_account_cost_summary(account_email: &str, days: i64) -> Result<AccountCostSummary, String> {
+pub fn get_account_cost_summary(
+    account_email: &str,
+    days: i64,
+) -> Result<AccountCostSummary, String> {
     let conn = connect_db()?;
     let days = days.max(1);
     let cutoff = chrono::Local::now() - chrono::Duration::days(days - 1);
