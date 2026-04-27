@@ -386,7 +386,7 @@ pub async fn handle_chat_completions(
                 // Loop to skip heartbeats during peek
                 loop {
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
+                        std::time::Duration::from_secs(300),
                         openai_stream.next(),
                     )
                     .await
@@ -431,9 +431,9 @@ pub async fn handle_chat_completions(
                         }
                         Err(_) => {
                             tracing::warn!(
-                                "[OpenAI] Timeout waiting for first data (60s), retrying..."
+                                "[OpenAI] First chunk timeout after 300s, retrying..."
                             );
-                            last_error = "Timeout waiting for first data".to_string();
+                            last_error = "First chunk timeout".to_string();
                             retry_this_account = true;
                             break;
                         }
@@ -450,6 +450,36 @@ pub async fn handle_chat_completions(
                         async move { Ok::<Bytes, String>(first_data_chunk.unwrap()) },
                     )
                     .chain(openai_stream);
+
+                // [NEW] 针对 OpenAI 流增加 300 秒空闲超时保护
+                let tid_for_stream = trace_id.clone();
+                let combined_stream = async_stream::stream! {
+                    let mut s = Box::pin(combined_stream);
+                    let mut meta_sent = false;
+
+                    loop {
+                        // [NEW] 补全 __cloudCodeMeta 响应元数据透传
+                        if !meta_sent {
+                            let meta_pkg = serde_json::json!({
+                                "__cloudCodeMeta": {
+                                    "traceId": tid_for_stream
+                                }
+                            });
+                            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&meta_pkg).unwrap())));
+                            meta_sent = true;
+                        }
+
+                        match tokio::time::timeout(std::time::Duration::from_secs(300), s.next()).await {
+                            Ok(Some(item)) => yield item,
+                            Ok(None) => break,
+                            Err(_) => {
+                                tracing::error!("[OpenAI-SSE] Idle timeout after 300s, terminating stream");
+                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+                                break;
+                            }
+                        }
+                    }
+                };
 
                 if client_wants_stream {
                     // 客户端请求流式，返回 SSE
@@ -572,7 +602,7 @@ pub async fn handle_chat_completions(
         }
 
         // 执行退避
-        if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+        if apply_retry_strategy(strategy.clone(), attempt, max_attempts, status_code, &trace_id).await {
             // [NEW] Apply Client Adapter "let_it_crash" strategy
             if let Some(adapter) = &client_adapter {
                 if adapter.let_it_crash() && attempt > 0 {
@@ -591,12 +621,17 @@ pub async fn handle_chat_completions(
             }
 
             // 判断是否需要轮换账号
-            if !should_rotate_account(status_code) {
-                debug!(
-                    "[{}] Keeping same account for status {} (server-side issue)",
-                    trace_id, status_code
-                );
-            }
+                // 判断是否需要轮换账号
+                let mut force_rotate = false;
+                if !should_rotate_account(status_code, Some(&strategy)) {
+                    debug!(
+                        "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
+                        trace_id, status_code
+                    );
+                    force_rotate = false;
+                } else {
+                    force_rotate = true;
+                }
 
             // 2. [REMOVED] 不再特殊处理 QUOTA_EXHAUSTED，允许账号轮换
             // if error_text.contains("QUOTA_EXHAUSTED") { ... }
@@ -1553,9 +1588,11 @@ pub async fn handle_completions(
         }
 
         // 确定重试策略
+        // 确定重试策略 (对齐官方 1.5s Grace Window)
         let strategy = determine_retry_strategy(status_code, &error_text, false);
 
-        if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+        // 执行退备
+        if apply_retry_strategy(strategy.clone(), attempt, max_attempts, status_code, &trace_id).await {
             // 继续重试 (loop 会增加 attempt, 导致 force_rotate=true)
             continue;
         } else {

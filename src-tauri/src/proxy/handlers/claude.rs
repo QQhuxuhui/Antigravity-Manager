@@ -977,7 +977,7 @@ pub async fn handle_messages(
 
                 // Loop to skip heartbeats during peek
                 loop {
-                    match tokio::time::timeout(std::time::Duration::from_secs(60), claude_stream.next()).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(300), claude_stream.next()).await {
                         Ok(Some(Ok(bytes))) => {
                             if bytes.is_empty() {
                                 continue;
@@ -1023,13 +1023,29 @@ pub async fn handle_messages(
                     Some(bytes) => {
                         // We have data! Construct the combined stream
                         let stream_rest = claude_stream;
-                        let combined_stream = Box::pin(futures::stream::once(async move { Ok(bytes) })
+                        let combined_stream = futures::stream::once(async move { Ok(bytes) })
                             .chain(stream_rest.map(|result| -> Result<Bytes, std::io::Error> {
                                 match result {
                                     Ok(b) => Ok(b),
                                     Err(e) => Ok(Bytes::from(format!("data: {{\"error\":\"{}\"}}\n\n", e))),
                                 }
-                            })));
+                            }));
+
+                        // [NEW] 针对 Claude 流增加 60 秒空闲超时保护
+                        let combined_stream = async_stream::stream! {
+                            let mut s = Box::pin(combined_stream);
+                            loop {
+                                match tokio::time::timeout(std::time::Duration::from_secs(300), s.next()).await {
+                                    Ok(Some(item)) => yield item,
+                                    Ok(None) => break,
+                                    Err(_) => {
+                                        tracing::error!("[Claude-SSE] Idle timeout after 300s, terminating stream");
+                                        yield Ok::<Bytes, std::io::Error>(Bytes::from("data: {\"type\": \"message_stop\"}\n\ndata: [DONE]\n\n"));
+                                        break;
+                                    }
+                                }
+                            }
+                        };
 
                         // 判断客户端期望的格式
                         if client_wants_stream {
@@ -1049,7 +1065,7 @@ pub async fn handle_messages(
                             // 客户端要非 Stream，需要收集完整响应并转换为 JSON
                             use crate::proxy::mappers::claude::collect_stream_to_json;
                             
-                            match collect_stream_to_json(combined_stream).await {
+                            match collect_stream_to_json(Box::pin(combined_stream)).await {
                                 Ok(full_response) => {
                                     info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
                                     return Response::builder()
@@ -1312,13 +1328,17 @@ pub async fn handle_messages(
         }
 
         // 确定重试策略
-        let strategy = determine_retry_strategy(status_code, &error_text, retried_without_thinking);
+        let retry_strategy = determine_retry_strategy(status_code, &error_text, retried_without_thinking);
         
         // 执行退避
-        if apply_retry_strategy(strategy, attempt, max_attempts, status_code, &trace_id).await {
+        let mut force_rotate = false;
+        if apply_retry_strategy(retry_strategy.clone(), attempt, max_attempts, status_code, &trace_id).await {
             // 判断是否需要轮换账号
-            if !should_rotate_account(status_code) {
-                debug!("[{}] Keeping same account for status {} (server-side issue)", trace_id, status_code);
+            if !should_rotate_account(status_code, Some(&retry_strategy)) {
+                debug!("[{}] Keeping same account for status {} (Grace Retry or Server Issue)", trace_id, status_code);
+                force_rotate = false;
+            } else {
+                force_rotate = true;
             }
             continue;
         } else {

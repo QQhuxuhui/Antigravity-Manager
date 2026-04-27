@@ -43,6 +43,24 @@ pub fn mask_email(email: &str) -> String {
     }
 }
 
+/// [NEW] 错误日志脱敏：抹除报错信息中的 access_token, proxy_url 等敏感凭证
+pub fn sanitize_error_for_log(error_text: &str) -> String {
+    // 抹除常见敏感 key 的值
+    let re = regex::Regex::new(r#"(?i)(access_token|refresh_token|id_token|authorization|api_key|secret|password|proxy_url|http_proxy|https_proxy)\s*[:=]\s*[^"'\\\s,}\]]+"#).unwrap();
+    let redacted = re.replace_all(error_text, "$1=<redacted>");
+    
+    // 抹除 Bearer token
+    let re_bearer = regex::Regex::new(r#"(?i)(bearer\s+)[^"'\\\s,}\]]+"#).unwrap();
+    let redacted = re_bearer.replace_all(&redacted, "$1<redacted>");
+    
+    // 限制长度防止日志炸弹
+    if redacted.len() > 1000 {
+        format!("{}... (truncated)", &redacted[..1000])
+    } else {
+        redacted.into_owned()
+    }
+}
+
 // Cloud Code v1internal endpoints (fallback order: Sandbox → Daily → Prod)
 // 优先使用 Sandbox/Daily 环境以避免 Prod环境的 429 错误 (Ref: Issue #1176)
 const V1_INTERNAL_BASE_URL_PROD: &str = "https://cloudcode-pa.googleapis.com/v1internal";
@@ -104,9 +122,10 @@ impl UpstreamClient {
             .emulation(rquest_util::Emulation::Chrome123)
             // Connection settings (优化连接复用，减少建立开销)
             .connect_timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(16) // 每主机最多 16 个空闲连接
+            .pool_max_idle_per_host(20) // 每主机最多 20 个空闲连接 (对齐官方指纹)
             .pool_idle_timeout(Duration::from_secs(90)) // 空闲连接保持 90 秒
             .tcp_keepalive(Duration::from_secs(60)) // TCP 保活探测 60 秒
+            // 强制开启 HTTP/2 协议，并支持在 SOCKS/HTTPS 代理下通过 ALPN 强制降级/协商
             .timeout(Duration::from_secs(600));
 
         builder = Self::apply_default_user_agent(builder);
@@ -133,7 +152,7 @@ impl UpstreamClient {
         let builder = Client::builder()
             .emulation(rquest_util::Emulation::Chrome123)
             .connect_timeout(Duration::from_secs(20))
-            .pool_max_idle_per_host(16)
+            .pool_max_idle_per_host(20)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60))
             .timeout(Duration::from_secs(600))
@@ -316,6 +335,16 @@ impl UpstreamClient {
         // This header belongs to the IDE's JS layer, not the official client's egress.
         // Sending it creates a contradictory "Electron + Node.js" fingerprint.
 
+        // [NEW] 深度解析 body 中的 project_id 并注入 Header
+        // 只有当 Body 包含 project 字段且非测试项目时，注入 x-goog-user-project
+        if let Some(proj) = body.get("project").and_then(|v| v.as_str()) {
+            if !proj.is_empty() && proj != "test-project" && proj != "project-id" {
+                if let Ok(hv) = header::HeaderValue::from_str(proj) {
+                    headers.insert("x-goog-user-project", hv);
+                }
+            }
+        }
+
         // 注入额外的 Headers (如 anthropic-beta)
         for (k, v) in extra_headers {
             if let Ok(hk) = header::HeaderName::from_bytes(k.as_bytes()) {
@@ -337,10 +366,16 @@ impl UpstreamClient {
             let url = Self::build_url(base_url, method, query_string);
             let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
 
+            let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+
             let response = client
                 .post(&url)
                 .headers(headers.clone())
-                .json(&body)
+                // [NEW] 强制分块传输仿真: 包装为流以触发 Transfer-Encoding: chunked
+                // 这对齐了官方 Go Worker 通过遮蔽 Content-Length 来模拟 IDE 流量的行为
+                .body(rquest::Body::wrap_stream(futures::stream::once(async move { 
+                    Ok::<_, std::io::Error>(body_bytes) 
+                })))
                 .send()
                 .await;
 
