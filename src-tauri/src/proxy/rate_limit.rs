@@ -194,14 +194,20 @@ impl RateLimitTracker {
         }
         
         // 1. 解析限流原因类型
+        let parsed_reason = self.parse_rate_limit_reason(body);
         let reason = if status == 429 {
             tracing::warn!("Google 429 Error Body: {}", body);
-            self.parse_rate_limit_reason(body)
+            parsed_reason
         } else if status == 404 {
             tracing::warn!("Google 404: model unavailable on this account, short lockout before rotation");
             RateLimitReason::ServerError
         } else {
-            RateLimitReason::ServerError
+            match parsed_reason {
+                RateLimitReason::QuotaExhausted
+                | RateLimitReason::RateLimitExceeded
+                | RateLimitReason::ModelCapacityExhausted => parsed_reason,
+                _ => RateLimitReason::ServerError,
+            }
         };
         
         let mut retry_after_sec = None;
@@ -304,7 +310,10 @@ impl RateLimitTracker {
         
         // [FIX] 使用复合 Key 存储 (如果是 Quota 且有 Model)
         // 只有 QuotaExhausted 适合做模型隔离，其他如 RateLimitExceeded 通常是全账号的 TPM
-        let use_model_key = matches!(reason, RateLimitReason::QuotaExhausted) && model.is_some();
+        let use_model_key = matches!(
+            reason,
+            RateLimitReason::QuotaExhausted | RateLimitReason::ModelCapacityExhausted
+        ) && model.is_some();
         let key = if use_model_key { 
             self.get_limit_key(account_id, model.as_deref())
         } else {
@@ -333,25 +342,29 @@ impl RateLimitTracker {
         let trimmed = body.trim();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(reason_str) = json.get("error")
+                if let Some(details) = json
+                    .get("error")
                     .and_then(|e| e.get("details"))
                     .and_then(|d| d.as_array())
-                    .and_then(|a| a.get(0))
-                    .and_then(|o| o.get("reason"))
-                    .and_then(|v| v.as_str()) {
-                    
-                    return match reason_str {
-                        "QUOTA_EXHAUSTED" => RateLimitReason::QuotaExhausted,
-                        "RATE_LIMIT_EXCEEDED" => RateLimitReason::RateLimitExceeded,
-                        "MODEL_CAPACITY_EXHAUSTED" => RateLimitReason::ModelCapacityExhausted,
-                        _ => RateLimitReason::Unknown,
-                    };
+                {
+                    for detail in details {
+                        if let Some(reason_str) = detail.get("reason").and_then(|v| v.as_str()) {
+                            if let Some(reason) = Self::reason_from_google_error_info(reason_str) {
+                                return reason;
+                            }
+                        }
+                    }
                 }
                 // [NEW] 尝试从 message 字段进行文本匹配（防止 missed reason）
                  if let Some(msg) = json.get("error")
                     .and_then(|e| e.get("message"))
                     .and_then(|v| v.as_str()) {
                     let msg_lower = msg.to_lowercase();
+                    if msg_lower.contains("model_capacity")
+                        || msg_lower.contains("model capacity")
+                    {
+                        return RateLimitReason::ModelCapacityExhausted;
+                    }
                     if msg_lower.contains("per minute") || msg_lower.contains("rate limit") {
                         return RateLimitReason::RateLimitExceeded;
                     }
@@ -362,12 +375,23 @@ impl RateLimitTracker {
         // 如果无法从 JSON 解析，尝试从消息文本判断
         let body_lower = body.to_lowercase();
         // [FIX] 优先判断分钟级限制，避免将 TPM 误判为 Quota
-        if body_lower.contains("per minute") || body_lower.contains("rate limit") || body_lower.contains("too many requests") {
+        if body_lower.contains("model_capacity") || body_lower.contains("model capacity") {
+            RateLimitReason::ModelCapacityExhausted
+        } else if body_lower.contains("per minute") || body_lower.contains("rate limit") || body_lower.contains("too many requests") {
              RateLimitReason::RateLimitExceeded
         } else if body_lower.contains("exhausted") || body_lower.contains("quota") {
             RateLimitReason::QuotaExhausted
         } else {
             RateLimitReason::Unknown
+        }
+    }
+
+    fn reason_from_google_error_info(reason_str: &str) -> Option<RateLimitReason> {
+        match reason_str {
+            "QUOTA_EXHAUSTED" => Some(RateLimitReason::QuotaExhausted),
+            "RATE_LIMIT_EXCEEDED" => Some(RateLimitReason::RateLimitExceeded),
+            "MODEL_CAPACITY_EXHAUSTED" => Some(RateLimitReason::ModelCapacityExhausted),
+            _ => None,
         }
     }
     
@@ -423,21 +447,35 @@ impl RateLimitTracker {
         let trimmed = body.trim();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                // 1. Google 常见的 quotaResetDelay 格式 (支持所有格式："2h1m1s", "1h30m", "42s", "500ms" 等)
-                // 路径: error.details[0].metadata.quotaResetDelay
-                if let Some(delay_str) = json.get("error")
+                // 1. Google 常见的 quotaResetDelay / RetryInfo.retryDelay 格式
+                // 路径:
+                // - error.details[].metadata.quotaResetDelay
+                // - error.details[].retryDelay
+                if let Some(details) = json
+                    .get("error")
                     .and_then(|e| e.get("details"))
                     .and_then(|d| d.as_array())
-                    .and_then(|a| a.get(0))
-                    .and_then(|o| o.get("metadata"))  // 添加 metadata 层级
-                    .and_then(|m| m.get("quotaResetDelay"))
-                    .and_then(|v| v.as_str()) {
-                    
-                    tracing::debug!("[JSON解析] 找到 quotaResetDelay: '{}'", delay_str);
-                    
-                    // 使用通用时间解析函数
-                    if let Some(seconds) = self.parse_duration_string(delay_str) {
-                        return Some(seconds);
+                {
+                    for detail in details {
+                        if let Some(delay_str) = detail
+                            .get("metadata")
+                            .and_then(|m| m.get("quotaResetDelay"))
+                            .and_then(|v| v.as_str())
+                        {
+                            tracing::debug!("[JSON解析] 找到 quotaResetDelay: '{}'", delay_str);
+                            if let Some(seconds) = self.parse_duration_string(delay_str) {
+                                return Some(seconds);
+                            }
+                        }
+
+                        if let Some(delay_str) =
+                            detail.get("retryDelay").and_then(|v| v.as_str())
+                        {
+                            tracing::debug!("[JSON解析] 找到 retryDelay: '{}'", delay_str);
+                            if let Some(seconds) = self.parse_duration_string(delay_str) {
+                                return Some(seconds);
+                            }
+                        }
                     }
                 }
                 
@@ -595,6 +633,45 @@ mod tests {
         }"#;
         let time = tracker.parse_retry_time_from_body(body);
         assert_eq!(time, Some(42));
+    }
+
+    #[test]
+    fn test_parse_google_rpc_retry_info_for_model_capacity() {
+        let tracker = RateLimitTracker::new();
+        let backoff_steps = vec![60, 300, 1800, 7200];
+        let body = r#"{
+            "error": {
+                "code": 503,
+                "status": "UNAVAILABLE",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "MODEL_CAPACITY_EXHAUSTED",
+                        "metadata": {
+                            "model": "claude-opus-4-6-thinking"
+                        }
+                    },
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "1.2s"
+                    }
+                ]
+            }
+        }"#;
+
+        let info = tracker
+            .parse_from_error(
+                "acc_capacity",
+                503,
+                None,
+                body,
+                Some("claude-opus-4-6-thinking".to_string()),
+                &backoff_steps,
+            )
+            .expect("503 MODEL_CAPACITY_EXHAUSTED should be parsed");
+
+        assert_eq!(info.reason, RateLimitReason::ModelCapacityExhausted);
+        assert_eq!(info.retry_after_sec, 2);
     }
 
     #[test]

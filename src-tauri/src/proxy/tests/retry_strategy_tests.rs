@@ -80,9 +80,11 @@ fn test_retry_strategy_model_capacity_retries_in_place() {
 
 #[test]
 fn test_retry_strategy_429_short_delay_grace_retries_until_7s() {
+    // retryDelay=4s 经 parse_retry_delay 加 1500ms grace window → 5500ms,
+    // 仍在 7s 阈值内 → GraceRetry 路径。
     let strategy = determine_retry_strategy(
         429,
-        r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"6s"}]}}"#,
+        r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"4s"}]}}"#,
         false,
     );
     assert!(

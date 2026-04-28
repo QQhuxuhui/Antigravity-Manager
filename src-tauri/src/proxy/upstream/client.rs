@@ -335,15 +335,10 @@ impl UpstreamClient {
         // This header belongs to the IDE's JS layer, not the official client's egress.
         // Sending it creates a contradictory "Electron + Node.js" fingerprint.
 
-        // [NEW] 深度解析 body 中的 project_id 并注入 Header
-        // 只有当 Body 包含 project 字段且非测试项目时，注入 x-goog-user-project
-        if let Some(proj) = body.get("project").and_then(|v| v.as_str()) {
-            if !proj.is_empty() && proj != "test-project" && proj != "project-id" {
-                if let Ok(hv) = header::HeaderValue::from_str(proj) {
-                    headers.insert("x-goog-user-project", hv);
-                }
-            }
-        }
+        // [REMOVED in fork] 上游 v4.1.32 在此处无差别注入 x-goog-user-project=body.project，
+        // 导致 free 账号 (project=lucid-data-XXX 等未启用 cloudcode-pa 的自动项目) 全部被 Google
+        // 以 SERVICE_DISABLED 拦截 (403 PERMISSION_DENIED)。upstream sync 时请勿恢复。
+        // 如要重启该注入，应仅对企业账号 (is_enterprise_client) 启用。
 
         // 注入额外的 Headers (如 anthropic-beta)
         for (k, v) in extra_headers {

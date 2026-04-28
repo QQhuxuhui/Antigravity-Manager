@@ -88,7 +88,7 @@ if [ "$USE_CACHE" = false ]; then
     BUILD_ARGS+=("--no-cache")
 fi
 
-docker build "${BUILD_ARGS[@]}" ${MIRROR_ARG} \
+docker build --network=host "${BUILD_ARGS[@]}" ${MIRROR_ARG} \
     -f "${DOCKERFILE}" \
     -t "${FULL_IMAGE}:v${NEW_VERSION}" \
     -t "${FULL_IMAGE}:latest" \

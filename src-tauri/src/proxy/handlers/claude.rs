@@ -1676,7 +1676,7 @@ pub async fn handle_messages(
             "error": {
                 "id": "err_retry_exhausted",
                 "type": error_type,
-                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
+                "message": format!("All retry attempts failed. Last status: {}. Error: {}", last_status, last_error)
             }
         }))).into_response()
     } else {
@@ -1709,7 +1709,7 @@ pub async fn handle_messages(
             "error": {
                 "id": "err_retry_exhausted",
                 "type": error_type,
-                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
+                "message": format!("All retry attempts failed. Last status: {}. Error: {}", last_status, last_error)
             }
         }))).into_response()
     }

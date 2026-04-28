@@ -91,6 +91,18 @@ pub struct TokenManager {
     cancel_token: CancellationToken,
 }
 
+/// Sentinel project_id from upstream's hardcoded fallback. Treat it as missing —
+/// sending it to cloudcode-pa.googleapis.com produces 403 USER_PROJECT_DENIED
+/// because lbjlaq's GCP project rejects external callers.
+const SENTINEL_PROJECT_ID: &str = "bamboo-precept-lgxtn";
+
+/// True when the stored project_id is empty or the legacy bamboo sentinel.
+/// Such accounts must trigger a fresh `loadCodeAssist` resolve, and if that
+/// fails they should be skipped (not sent to upstream with the sentinel).
+fn is_invalid_project_id(pid: &str) -> bool {
+    pid.is_empty() || pid == SENTINEL_PROJECT_ID
+}
+
 impl TokenManager {
     const ACCOUNT_SOFT_INFLIGHT_LIMIT: usize = 2;
     const LOCAL_RPM_WINDOW_SECS: u64 = 60;
@@ -1751,9 +1763,9 @@ impl TokenManager {
                                 }
                             }
 
-                            // 确保有 project_id (filter empty strings to trigger re-fetch)
+                            // 确保有 project_id (filter empty / sentinel strings to trigger re-fetch)
                             let project_id = if let Some(pid) = &token.project_id {
-                                if pid.is_empty() {
+                                if is_invalid_project_id(pid) {
                                     None
                                 } else {
                                     Some(pid.clone())
@@ -1761,8 +1773,8 @@ impl TokenManager {
                             } else {
                                 None
                             };
-                            let project_id = if let Some(pid) = project_id {
-                                pid
+                            let project_id_opt: Option<String> = if let Some(pid) = project_id {
+                                Some(pid)
                             } else {
                                 match crate::proxy::project_resolver::fetch_project_id(
                                     &token.access_token,
@@ -1776,22 +1788,31 @@ impl TokenManager {
                                             entry.project_id = Some(pid.clone());
                                         }
                                         let _ = self.save_project_id(&token.account_id, &pid).await;
-                                        pid
+                                        Some(pid)
                                     }
-                                    Err(_) => "bamboo-precept-lgxtn".to_string(), // fallback
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "🔒 [FIX #820] Preferred account {} project_id resolve failed ({}), falling back to round-robin",
+                                            token.email, e
+                                        );
+                                        None
+                                    }
                                 }
                             };
 
-                            self.record_local_dispatch(&token.account_id);
-                            let load_guard = self.acquire_account_load_slot(&token.account_id);
-                            return Ok((
-                                token.access_token,
-                                project_id,
-                                token.email,
-                                token.account_id,
-                                0,
-                                load_guard,
-                            ));
+                            if let Some(project_id) = project_id_opt {
+                                self.record_local_dispatch(&token.account_id);
+                                let load_guard = self.acquire_account_load_slot(&token.account_id);
+                                return Ok((
+                                    token.access_token,
+                                    project_id,
+                                    token.email,
+                                    token.account_id,
+                                    0,
+                                    load_guard,
+                                ));
+                            }
+                            // else: drop through to round-robin path below
                         } else {
                             if is_rate_limited {
                                 tracing::warn!("🔒 [FIX #820] Preferred account {} is rate-limited, falling back to round-robin", preferred_token.email);
@@ -2235,7 +2256,7 @@ impl TokenManager {
 
             // 4. [ENHANCED] 确保有 project_id (使用锁保护 fetch 动作)
             let project_id = if let Some(pid) = &token.project_id {
-                if pid.is_empty() {
+                if is_invalid_project_id(pid) {
                     None
                 } else {
                     Some(pid.clone())
@@ -2243,8 +2264,8 @@ impl TokenManager {
             } else {
                 None
             };
-            let project_id = if let Some(pid) = project_id {
-                pid
+            let project_id_opt: Option<String> = if let Some(pid) = project_id {
+                Some(pid)
             } else {
                 let project_mu = self
                     .refresh_locks
@@ -2257,10 +2278,10 @@ impl TokenManager {
                     .tokens
                     .get(&token.account_id)
                     .and_then(|t| t.project_id.clone())
-                    .filter(|pid| !pid.is_empty());
+                    .filter(|pid| !is_invalid_project_id(pid));
 
                 if let Some(pid) = latest_pid {
-                    pid
+                    Some(pid)
                 } else {
                     tracing::debug!("账号 {} 缺少 project_id，尝试获取...", token.email);
                     match crate::proxy::project_resolver::fetch_project_id(&token.access_token)
@@ -2271,17 +2292,35 @@ impl TokenManager {
                                 entry.project_id = Some(pid.clone());
                             }
                             let _ = self.save_project_id(&token.account_id, &pid).await;
-                            pid
+                            Some(pid)
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Failed to fetch project_id for {}, using fallback: {}",
+                                "账号 {} project_id 解析失败 ({})，跳过该账号",
                                 token.email,
                                 e
                             );
-                            "bamboo-precept-lgxtn".to_string()
+                            None
                         }
                     }
+                }
+            };
+
+            let project_id = match project_id_opt {
+                Some(pid) => pid,
+                None => {
+                    attempted.insert(token.account_id.clone());
+                    last_error = Some(format!(
+                        "account {} missing/unresolvable project_id, skipping",
+                        token.email
+                    ));
+                    if quota_group != "image_gen"
+                        && matches!(&last_used_account_id, Some((id, _)) if id == &token.account_id)
+                    {
+                        need_update_last_used =
+                            Some((String::new(), std::time::Instant::now()));
+                    }
+                    continue;
                 }
             };
 
@@ -2437,9 +2476,15 @@ impl TokenManager {
             None => return Err(format!("未找到账号: {}", email)),
         };
 
-        let project_id = project_id_opt
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+        let project_id = match project_id_opt
+            .filter(|s| !is_invalid_project_id(s))
+        {
+            Some(pid) => pid,
+            None => return Err(format!(
+                "[Warmup] account {} has no valid project_id (re-auth required)",
+                email
+            )),
+        };
 
         // 检查是否过期 (提前5分钟)
         if now < timestamp + expires_in - 300 {
@@ -2860,9 +2905,13 @@ impl TokenManager {
             return;
         }
 
-        // 检查 API 是否返回了精确的重试时间
-        let has_explicit_retry_time =
-            retry_after_header.is_some() || error_body.contains("quotaResetDelay");
+        // 检查 API 是否返回了精确的重试时间。Google RPC 在短暂限流时常用
+        // RetryInfo.retryDelay 表达"窗口型"重试时间,这种情况不能再走 quota
+        // reset 长锁,而是按短退避处理。
+        let body_lower = error_body.to_lowercase();
+        let has_explicit_retry_time = retry_after_header.is_some()
+            || body_lower.contains("quotaresetdelay")
+            || body_lower.contains("retrydelay");
 
         if has_explicit_retry_time {
             // API 返回了精确时间(quotaResetDelay),直接使用,无需实时刷新
@@ -2888,6 +2937,22 @@ impl TokenManager {
             );
             return;
         }
+
+        // 只有 429 的真实 quota 耗尽才适合刷新 quota 并锁到 reset_time。
+        // 503/529/500/404 是短暂过载或服务端问题；把它们锁到配额刷新点会导致
+        // "All accounts limited. Wait xxxx" 并阻止后续请求拿到恢复后的资源。
+        if status != 429 || reason != crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
+            self.rate_limit_tracker.parse_from_error(
+                &account_id,
+                status,
+                retry_after_header,
+                error_body,
+                model_to_track.map(|s| s.to_string()),
+                &config.backoff_steps,
+            );
+            return;
+        }
+
 
         // API 未返回 quotaResetDelay,需要实时刷新配额获取精确锁定时间
         if let Some(m) = model_to_track {
@@ -3025,10 +3090,20 @@ impl TokenManager {
             .await
             .map_err(|e| format!("Invalid refresh token: {}", e))?;
 
-        // 2. 获取项目 ID (Project ID)
-        let project_id = crate::proxy::project_resolver::fetch_project_id(&token_info.access_token)
-            .await
-            .unwrap_or_else(|_| "bamboo-precept-lgxtn".to_string()); // Fallback
+        // 2. 获取项目 ID (Project ID) — 解析失败就存 None，不再用 sentinel 占位。
+        // 运行时路径会在 None 时再次解析 (fetch_project_id)，确实失败则跳过该账号，
+        // 避免把 lbjlaq 自家的 sentinel 写进磁盘后永远触发 USER_PROJECT_DENIED。
+        let project_id_opt: Option<String> =
+            match crate::proxy::project_resolver::fetch_project_id(&token_info.access_token).await {
+                Ok(pid) => Some(pid),
+                Err(e) => {
+                    tracing::warn!(
+                        "[add_account] project_id 解析失败 ({}), 账号 {} 创建时 project_id 留空，运行时再试",
+                        e, email
+                    );
+                    None
+                }
+            };
 
         // 3. 委托给 modules::account::add_account 处理 (包含文件写入、索引更新、锁)
         let email_clone = email.to_string();
@@ -3040,7 +3115,7 @@ impl TokenManager {
                 refresh_token_clone,
                 token_info.expires_in,
                 Some(email_clone.clone()),
-                Some(project_id),
+                project_id_opt,
                 None, // session_id
                 true,
             )
@@ -3321,6 +3396,97 @@ fn truncate_reason(reason: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    #[tokio::test]
+    async fn test_503_does_not_lock_until_cached_quota_reset_time() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-503-lockout-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+
+        let account_id = "acc_503_cached_quota";
+        let reset_time = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        let account_path = accounts_dir.join(format!("{}.json", account_id));
+        let account_json = serde_json::json!({
+            "id": account_id,
+            "email": "capacity@test.com",
+            "quota": {
+                "models": [{
+                    "name": "claude-sonnet-4-6",
+                    "percentage": 100,
+                    "reset_time": reset_time
+                }]
+            }
+        });
+        std::fs::write(
+            &account_path,
+            serde_json::to_string_pretty(&account_json).unwrap(),
+        )
+        .unwrap();
+
+        let manager = TokenManager::new(tmp_root.clone());
+        manager
+            .mark_rate_limited_async(account_id, 503, None, "Service Unavailable", None)
+            .await;
+
+        let wait = manager
+            .get_rate_limit_reset_seconds(account_id)
+            .expect("503 should create a short soft cooldown");
+        assert!(
+            wait <= 10,
+            "503 should use a short server-error cooldown, not cached quota reset; got {}s",
+            wait
+        );
+
+        let _ = std::fs::remove_dir_all(tmp_root);
+    }
+
+    #[tokio::test]
+    async fn test_model_capacity_exhausted_does_not_create_rate_limit_lock() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-token-manager-test-model-capacity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let manager = TokenManager::new(tmp_root.clone());
+        let body = r#"{
+            "error": {
+                "code": 503,
+                "status": "UNAVAILABLE",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "MODEL_CAPACITY_EXHAUSTED",
+                        "metadata": { "model": "claude-sonnet-4-6" }
+                    },
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "39s"
+                    }
+                ]
+            }
+        }"#;
+
+        manager
+            .mark_rate_limited_async(
+                "acc_model_capacity",
+                503,
+                None,
+                body,
+                Some("claude-sonnet-4-6"),
+            )
+            .await;
+
+        assert!(
+            !manager
+                .is_rate_limited("acc_model_capacity", Some("claude"))
+                .await,
+            "MODEL_CAPACITY_EXHAUSTED should not lock the account/model; handler retries in-place"
+        );
+
+        let _ = std::fs::remove_dir_all(tmp_root);
+    }
 
     #[tokio::test]
     async fn test_reload_account_purges_cache_when_account_becomes_proxy_disabled() {

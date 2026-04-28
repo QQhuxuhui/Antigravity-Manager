@@ -421,12 +421,21 @@ pub async fn get_valid_token_for_warmup(account: &crate::models::account::Accoun
         }
     }
     
-    // Fetch project_id
+    // Fetch project_id — fail loudly instead of falling back to lbjlaq's sentinel
+    // ("bamboo-precept-lgxtn"), which would just produce 403 USER_PROJECT_DENIED upstream.
+    // Caller (trigger_warmup_for_account) already handles `Err` by silently skipping.
     let project_id = fetch_project_id(&account.token.access_token, &account.email, Some(&account.id))
         .await
-        .and_then(|(pid, _, _)| pid);
-    let final_pid = project_id.unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
-    
+        .and_then(|(pid, _, _)| pid)
+        .filter(|pid| !pid.is_empty() && pid != "bamboo-precept-lgxtn");
+    let final_pid = match project_id {
+        Some(pid) => pid,
+        None => return Err(format!(
+            "[Warmup] account {} has no resolvable project_id; skipping",
+            account.email
+        )),
+    };
+
     Ok((account.token.access_token, final_pid))
 }
 

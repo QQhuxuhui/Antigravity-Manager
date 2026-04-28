@@ -166,17 +166,14 @@ pub async fn internal_start_proxy_service(
     // 3. 加載賬號
     let active_accounts = token_manager.load_accounts().await.unwrap_or(0);
 
+    // 即使账号数为 0，也继续把 is_running 翻成 true，让 service_status 中间件放行：
+    // 这样后续通过 admin API 添加的账号能直接被 token_manager 热感知，无需手工再点"启动"。
+    // 之前的提前 return 在 v4.1.32 的服务闸下导致 headless 容器永远 503。
     if active_accounts == 0 {
         let zai_enabled = config.zai.enabled
             && !matches!(config.zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
         if !zai_enabled {
-            tracing::warn!("沒有可用賬號，反代邏輯將暫停，請通過管理界面添加。");
-            return Ok(ProxyStatus {
-                running: false,
-                port: config.port,
-                base_url: format!("http://127.0.0.1:{}", config.port),
-                active_accounts: 0,
-            });
+            tracing::warn!("沒有可用賬號（继续启用反代逻辑，账号添加后即时生效）。");
         }
     }
 

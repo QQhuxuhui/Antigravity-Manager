@@ -13,8 +13,15 @@ pub async fn service_status_middleware(
 ) -> Response {
     let path = request.uri().path();
     
-    // Always allow Admin API and Auth callback
-    if path.starts_with("/api/") || path == "/auth/callback" || path == "/health" {
+    // Always allow Admin API, Auth callback, health checks, and internal endpoints.
+    // /internal/* is loopback-only (e.g. warmup self-call from quota.rs); the auth
+    // middleware already exempts it, so the service-status gate must too — otherwise
+    // the warmup scheduler 503's itself before is_running ever flips on a fresh start.
+    if path.starts_with("/api/")
+        || path.starts_with("/internal/")
+        || path == "/auth/callback"
+        || path == "/health"
+    {
         return next.run(request).await;
     }
 
