@@ -103,6 +103,17 @@ fn is_invalid_project_id(pid: &str) -> bool {
     pid.is_empty() || pid == SENTINEL_PROJECT_ID
 }
 
+/// Extract the wait-seconds value from a "Model capacity cooldown active for X. Wait Ns." error.
+/// Returns None for any error string that does not match this format.
+fn parse_capacity_cooldown_wait(error: &str) -> Option<u64> {
+    if !error.contains("Model capacity cooldown active") {
+        return None;
+    }
+    let after = error.split("Wait ").nth(1)?;
+    let n_str = after.split('s').next()?;
+    n_str.trim().parse().ok()
+}
+
 impl TokenManager {
     const ACCOUNT_SOFT_INFLIGHT_LIMIT: usize = 2;
     const LOCAL_RPM_WINDOW_SECS: u64 = 60;
@@ -1468,17 +1479,55 @@ impl TokenManager {
 
         // 【优化 Issue #284】添加 5 秒超时，防止死锁
         let timeout_duration = std::time::Duration::from_secs(5);
-        match tokio::time::timeout(
+        let first = match tokio::time::timeout(
             timeout_duration,
             self.get_token_internal(quota_group, force_rotate, session_id, target_model),
         )
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(
-                "Token acquisition timeout (5s) - system too busy or deadlock detected".to_string(),
-            ),
+            Err(_) => {
+                return Err(
+                    "Token acquisition timeout (5s) - system too busy or deadlock detected"
+                        .to_string(),
+                );
+            }
+        };
+
+        // If the only failure is a short model-capacity cooldown, wait it out and retry once.
+        // The cooldown is set when all in-place ModelCapacityRetry attempts already exhausted
+        // every account in the pool, so rotating now would just re-hit the same upstream error;
+        // sleeping until the global model lock expires gives the upstream a chance to recover.
+        if let Err(ref e) = first {
+            if let Some(wait_secs) = parse_capacity_cooldown_wait(e) {
+                if wait_secs > 0 && wait_secs <= Self::MODEL_CAPACITY_COOLDOWN_SECS {
+                    tracing::info!(
+                        "Model capacity cooldown for {} ({}s); waiting then retrying once",
+                        target_model,
+                        wait_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs.saturating_add(1)))
+                        .await;
+                    return match tokio::time::timeout(
+                        timeout_duration,
+                        self.get_token_internal(
+                            quota_group,
+                            force_rotate,
+                            session_id,
+                            target_model,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(
+                            "Token acquisition timeout (5s) on cooldown retry".to_string(),
+                        ),
+                    };
+                }
+            }
         }
+        first
     }
 
     /// 内部实现：获取 Token 的核心逻辑
@@ -4148,6 +4197,75 @@ mod tests {
         manager.mark_model_capacity_cooldown("claude-sonnet");
         assert!(manager.model_capacity_remaining_wait("claude-sonnet") > 0);
         assert_eq!(manager.model_capacity_remaining_wait("gemini-flash"), 0);
+    }
+
+    #[test]
+    fn test_parse_capacity_cooldown_wait_extracts_seconds() {
+        assert_eq!(
+            parse_capacity_cooldown_wait(
+                "Model capacity cooldown active for claude-sonnet. Wait 7s."
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            parse_capacity_cooldown_wait("Model capacity cooldown active for claude. Wait 1s."),
+            Some(1)
+        );
+        assert_eq!(
+            parse_capacity_cooldown_wait("Model capacity cooldown active for gpt-5. Wait 10s."),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn test_parse_capacity_cooldown_wait_returns_none_for_unrelated_errors() {
+        assert_eq!(parse_capacity_cooldown_wait("Token pool is empty"), None);
+        assert_eq!(
+            parse_capacity_cooldown_wait("No accounts available with quota for model: claude"),
+            None
+        );
+        assert_eq!(parse_capacity_cooldown_wait(""), None);
+    }
+
+    /// Verify get_token sleeps through a short capacity cooldown before returning.
+    /// Without the wait+retry the cooldown error returns in microseconds; with it,
+    /// the call sleeps wait_secs + 1s buffer so a follow-up retry can succeed.
+    /// We assert only the timing contract here — the retry's end-to-end success
+    /// path requires too much OAuth/account setup to be worth mocking in a unit test.
+    /// Note: get_token normalizes the target model via normalize_to_standard_id
+    /// (e.g. "claude-sonnet" → "claude"), so cooldown is keyed on the normalized id.
+    #[tokio::test]
+    async fn test_get_token_waits_for_short_capacity_cooldown_before_returning() {
+        let manager = TokenManager::new(PathBuf::from("/tmp/test_cooldown_retry"));
+
+        let mut token = create_test_token("retry@test.com", Some("PRO"), 1.0, None, Some(80));
+        token.model_quotas.insert("claude".to_string(), 1000);
+        manager.tokens.insert("retry@test.com".to_string(), token);
+
+        // Inject a 1-second cooldown on the normalized id directly
+        // (bypasses the 10s default in mark_model_capacity_cooldown).
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        manager
+            .model_capacity_cooldowns
+            .insert("claude".to_string(), until);
+        assert!(manager.model_capacity_remaining_wait("claude") > 0);
+
+        let start = std::time::Instant::now();
+        let _ = manager
+            .get_token("claude", false, None, "claude-sonnet")
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "should have slept ≥2s (wait_secs+1 buffer); slept {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "should not over-sleep; slept {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
