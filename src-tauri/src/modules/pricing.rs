@@ -148,12 +148,7 @@ pub fn lookup(model: &str) -> Option<ModelPricing> {
 
 /// Compute USD cost for a (model, input, output, cache_read) tuple. Returns
 /// 0.0 if the model is unknown so callers don't need to handle None.
-pub fn cost_usd(
-    model: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-) -> f64 {
+pub fn cost_usd(model: &str, input_tokens: u64, output_tokens: u64, cache_read_tokens: u64) -> f64 {
     match lookup(model) {
         Some(p) => compute_cost(&p, input_tokens, output_tokens, cache_read_tokens),
         None => 0.0,
@@ -191,7 +186,12 @@ mod tests {
         };
         let cost = compute_cost(&p, 1_000, 400, 8_000);
         let expected = 1_000.0 * 1.25e-6 + 400.0 * 10.0e-6 + 8_000.0 * 0.3125e-6;
-        assert!((cost - expected).abs() < 1e-12, "got {} expected {}", cost, expected);
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "got {} expected {}",
+            cost,
+            expected
+        );
     }
 
     #[test]
@@ -206,7 +206,12 @@ mod tests {
         };
         let cost = compute_cost(&p, 100, 200, 500);
         let expected = 100.0 * 2.0e-6 + 200.0 * 8.0e-6 + 500.0 * 2.0e-6;
-        assert!((cost - expected).abs() < 1e-12, "got {} expected {}", cost, expected);
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "got {} expected {}",
+            cost,
+            expected
+        );
     }
 
     #[test]
