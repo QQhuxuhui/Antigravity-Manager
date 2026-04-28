@@ -2317,8 +2317,7 @@ impl TokenManager {
                     if quota_group != "image_gen"
                         && matches!(&last_used_account_id, Some((id, _)) if id == &token.account_id)
                     {
-                        need_update_last_used =
-                            Some((String::new(), std::time::Instant::now()));
+                        need_update_last_used = Some((String::new(), std::time::Instant::now()));
                     }
                     continue;
                 }
@@ -2476,14 +2475,14 @@ impl TokenManager {
             None => return Err(format!("未找到账号: {}", email)),
         };
 
-        let project_id = match project_id_opt
-            .filter(|s| !is_invalid_project_id(s))
-        {
+        let project_id = match project_id_opt.filter(|s| !is_invalid_project_id(s)) {
             Some(pid) => pid,
-            None => return Err(format!(
-                "[Warmup] account {} has no valid project_id (re-auth required)",
-                email
-            )),
+            None => {
+                return Err(format!(
+                    "[Warmup] account {} has no valid project_id (re-auth required)",
+                    email
+                ))
+            }
         };
 
         // 检查是否过期 (提前5分钟)
@@ -2953,7 +2952,6 @@ impl TokenManager {
             return;
         }
 
-
         // API 未返回 quotaResetDelay,需要实时刷新配额获取精确锁定时间
         if let Some(m) = model_to_track {
             tracing::info!(
@@ -3093,17 +3091,20 @@ impl TokenManager {
         // 2. 获取项目 ID (Project ID) — 解析失败就存 None，不再用 sentinel 占位。
         // 运行时路径会在 None 时再次解析 (fetch_project_id)，确实失败则跳过该账号，
         // 避免把 lbjlaq 自家的 sentinel 写进磁盘后永远触发 USER_PROJECT_DENIED。
-        let project_id_opt: Option<String> =
-            match crate::proxy::project_resolver::fetch_project_id(&token_info.access_token).await {
-                Ok(pid) => Some(pid),
-                Err(e) => {
-                    tracing::warn!(
+        let project_id_opt: Option<String> = match crate::proxy::project_resolver::fetch_project_id(
+            &token_info.access_token,
+        )
+        .await
+        {
+            Ok(pid) => Some(pid),
+            Err(e) => {
+                tracing::warn!(
                         "[add_account] project_id 解析失败 ({}), 账号 {} 创建时 project_id 留空，运行时再试",
                         e, email
                     );
-                    None
-                }
-            };
+                None
+            }
+        };
 
         // 3. 委托给 modules::account::add_account 处理 (包含文件写入、索引更新、锁)
         let email_clone = email.to_string();

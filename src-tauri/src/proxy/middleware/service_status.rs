@@ -1,10 +1,10 @@
+use crate::proxy::server::AppState;
 use axum::{
     extract::{Request, State},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    http::StatusCode,
 };
-use crate::proxy::server::AppState;
 
 pub async fn service_status_middleware(
     State(state): State<AppState>,
@@ -12,7 +12,7 @@ pub async fn service_status_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    
+
     // Always allow Admin API, Auth callback, health checks, and internal endpoints.
     // /internal/* is loopback-only (e.g. warmup self-call from quota.rs); the auth
     // middleware already exempts it, so the service-status gate must too — otherwise
